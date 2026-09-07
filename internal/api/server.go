@@ -14,6 +14,7 @@ import (
 	"github.com/salman/ble-webrtc-tun/internal/accounts"
 	"github.com/salman/ble-webrtc-tun/internal/db"
 	"github.com/salman/ble-webrtc-tun/internal/router"
+	"github.com/salman/ble-webrtc-tun/internal/s3sync"
 	"github.com/salman/ble-webrtc-tun/internal/webui"
 )
 
@@ -48,6 +49,9 @@ type Server struct {
 
 	// Remote server URL (auto-detected from Clever Cloud, used by client)
 	RemoteServerURL string
+
+	// S3 continuous syncer (used on server to persist database to Clever Cloud Cellar S3)
+	S3Syncer *s3sync.Syncer
 }
 
 // Config holds configuration for the API server.
@@ -203,6 +207,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/dns/benchmark/start", s.handleDNSBenchmarkStart)
 	s.mux.HandleFunc("/api/dns/benchmark/status", s.handleDNSBenchmarkStatus)
 	s.mux.HandleFunc("/api/dns/benchmark/stop", s.handleDNSBenchmarkStop)
+
+	// S3 Cloud Persistence (Clever Cloud Cellar S3)
+	s.mux.HandleFunc("/api/s3/status", s.handleS3Status)
+	s.mux.HandleFunc("/api/s3/backup", s.handleS3Backup)
+	s.mux.HandleFunc("/api/s3/restore", s.handleS3Restore)
 
 	// Web Terminal (xterm.js)
 	s.mux.HandleFunc("/api/terminal/ws", s.handleTerminalWS)

@@ -28,6 +28,7 @@ import (
 	"github.com/salman/ble-webrtc-tun/internal/logger"
 	"github.com/salman/ble-webrtc-tun/internal/quicconn"
 	"github.com/salman/ble-webrtc-tun/internal/router"
+	"github.com/salman/ble-webrtc-tun/internal/s3sync"
 	"github.com/salman/ble-webrtc-tun/internal/transport"
 )
 
@@ -69,11 +70,42 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Initialize S3 Persistence (Clever Cloud Cellar S3)
+	s3Cfg := s3sync.LoadConfig()
+	var s3Syncer *s3sync.Syncer
+	if s3Cfg.IsConfigured() {
+		mainLog.Info("☁️ Clever Cloud Cellar S3 persistence configured (bucket: %s, host: %s)", s3Cfg.Bucket, s3Cfg.Host)
+		s3Client := s3sync.NewClient(s3Cfg)
+		s3Syncer = s3sync.NewSyncer(s3Client, "data/server.db", func() error {
+			if serverDB != nil {
+				return serverDB.CheckpointWAL()
+			}
+			return nil
+		})
+
+		// Restore database from S3 before db.Init opens it
+		restoreCtx, restoreCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		restored, rErr := s3Syncer.Restore(restoreCtx)
+		restoreCancel()
+		if rErr != nil {
+			mainLog.Warn("☁️ S3 database restore warning: %v (continuing with local/fresh db)", rErr)
+		} else if restored {
+			mainLog.Info("☁️ Successfully restored server database from S3 bucket '%s'", s3Cfg.Bucket)
+		}
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
 		mainLog.Info("Shutting down...")
+		if s3Syncer != nil {
+			mainLog.Info("☁️ Flushing server database to S3 before exit...")
+			flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = s3Syncer.FlushSync(flushCtx)
+			flushCancel()
+			mainLog.Info("☁️ S3 database flush complete")
+		}
 		cancel()
 	}()
 
@@ -83,6 +115,19 @@ func main() {
 		mainLog.Fatal("Database init failed: %v", err)
 	}
 	defer serverDB.Close()
+
+	// Connect S3 syncer to database mutations
+	if s3Syncer != nil {
+		serverDB.OnMutation(func() {
+			s3Syncer.NotifyChange()
+		})
+		s3Syncer.Start(ctx)
+		// Perform an initial background sync after startup
+		go func() {
+			time.Sleep(3 * time.Second)
+			_ = s3Syncer.SyncNow(context.Background())
+		}()
+	}
 
 	// Load persisted Bale client-emulation constants from the database so they
 	// survive restarts, then refresh from the live Bale bundle.  Bale silently
@@ -127,6 +172,7 @@ func main() {
 		Username: cfg.AdminUsername,
 		Password: cfg.AdminPassword,
 	})
+	apiSrv.S3Syncer = s3Syncer
 	apiSrv.OnForceEndCall = func() (map[string]interface{}, error) {
 		sessions := callRouter.GetAllSessions()
 		ended := 0

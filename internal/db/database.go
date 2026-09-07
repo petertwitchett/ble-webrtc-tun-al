@@ -22,9 +22,11 @@ var (
 
 // Database wraps the GORM DB connection with helper methods.
 type Database struct {
-	DB   *gorm.DB
-	role string // "client" or "server"
-	path string
+	DB                *gorm.DB
+	role              string // "client" or "server"
+	path              string
+	mutationMu        sync.RWMutex
+	mutationCallbacks []func()
 }
 
 // Init initializes the database singleton for the given role.
@@ -96,13 +98,55 @@ func open(role string) (*Database, error) {
 		return nil, fmt.Errorf("auto-migrate: %w", err)
 	}
 
-	dbLog.Info("✅ Database ready (role=%s)", role)
-
-	return &Database{
+	d := &Database{
 		DB:   db,
 		role: role,
 		path: dbPath,
-	}, nil
+	}
+
+	// Register mutation hooks on database modifications (used for S3 sync)
+	notifyFn := func(tx *gorm.DB) {
+		if tx.Error == nil {
+			d.triggerMutation()
+		}
+	}
+	_ = db.Callback().Create().After("gorm:create").Register("db:after_create_mutation", notifyFn)
+	_ = db.Callback().Update().After("gorm:update").Register("db:after_update_mutation", notifyFn)
+	_ = db.Callback().Delete().After("gorm:delete").Register("db:after_delete_mutation", notifyFn)
+
+	dbLog.Info("✅ Database ready (role=%s)", role)
+
+	return d, nil
+}
+
+// OnMutation registers a callback executed whenever records are created, updated, or deleted.
+func (d *Database) OnMutation(cb func()) {
+	d.mutationMu.Lock()
+	defer d.mutationMu.Unlock()
+	d.mutationCallbacks = append(d.mutationCallbacks, cb)
+}
+
+func (d *Database) triggerMutation() {
+	d.mutationMu.RLock()
+	if len(d.mutationCallbacks) == 0 {
+		d.mutationMu.RUnlock()
+		return
+	}
+	cbs := make([]func(), len(d.mutationCallbacks))
+	copy(cbs, d.mutationCallbacks)
+	d.mutationMu.RUnlock()
+
+	for _, cb := range cbs {
+		go cb()
+	}
+}
+
+// CheckpointWAL instructs SQLite to checkpoint all WAL changes into the main database file.
+func (d *Database) CheckpointWAL() error {
+	if d.DB == nil {
+		return fmt.Errorf("db not initialized")
+	}
+	return d.DB.Exec("PRAGMA wal_checkpoint(FULL)").Error
 }
 
 // Role returns the database role (client or server).
@@ -123,3 +167,4 @@ func (d *Database) Close() error {
 	}
 	return sqlDB.Close()
 }
+

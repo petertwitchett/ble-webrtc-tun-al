@@ -131,6 +131,11 @@ export const api = {
   dbBackup: () => request('/db/backup'),
   dbRestore: (data: any) => request('/db/restore', { method: 'POST', body: JSON.stringify(data) }),
 
+  // S3 Cloud Persistence (Clever Cloud Cellar S3)
+  getS3Status: () => request('/s3/status'),
+  triggerS3Backup: () => request('/s3/backup', { method: 'POST' }),
+  triggerS3Restore: () => request('/s3/restore', { method: 'POST' }),
+
   // Logs
   getLogs: (limit?: number, level?: string, component?: string) => {
     const params = new URLSearchParams();

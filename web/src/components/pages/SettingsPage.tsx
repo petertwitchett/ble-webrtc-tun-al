@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import {
   Card, Typography, Select, Button, Space, Row, Col, Tag, message,
   Descriptions, Badge, Alert, Upload, Divider, Input, Table, Progress,
-  Popover, Switch
+  Popover, Switch, Popconfirm
 } from 'antd';
 import {
   SyncOutlined, CloudSyncOutlined, CheckCircleOutlined, DownloadOutlined,
@@ -40,6 +40,54 @@ export function SettingsPage() {
   const [baleSyncing, setBaleSyncing] = useState(false);
   const [routing, setRouting] = useState({ dns_primary: '', dns_secondary: '', bypass_domains: '' });
   const [routingSaving, setRoutingSaving] = useState(false);
+
+  // S3 Cloud Persistence state
+  const [s3Status, setS3Status] = useState<any>(null);
+  const [s3BackupLoading, setS3BackupLoading] = useState(false);
+  const [s3RestoreLoading, setS3RestoreLoading] = useState(false);
+
+  const loadS3Status = useCallback(async () => {
+    try {
+      const res = await api.getS3Status();
+      setS3Status(res);
+    } catch {
+      // ignore if not supported
+    }
+  }, []);
+
+  useEffect(() => {
+    loadS3Status();
+  }, [loadS3Status]);
+
+  const handleS3BackupNow = async () => {
+    setS3BackupLoading(true);
+    try {
+      await api.triggerS3Backup();
+      message.success('Database successfully backed up to Cellar S3!');
+      await loadS3Status();
+    } catch (e: any) {
+      message.error(e.message || 'S3 backup failed');
+    } finally {
+      setS3BackupLoading(false);
+    }
+  };
+
+  const handleS3RestoreNow = async () => {
+    setS3RestoreLoading(true);
+    try {
+      const res = await api.triggerS3Restore();
+      if (res?.restored) {
+        message.success('Database successfully restored from S3!');
+      } else {
+        message.info(res?.message || 'No backup found in S3');
+      }
+      await loadS3Status();
+    } catch (e: any) {
+      message.error(e.message || 'S3 restore failed');
+    } finally {
+      setS3RestoreLoading(false);
+    }
+  };
 
   // DNS Speed Benchmark state
   const [benchmarkStatus, setBenchmarkStatus] = useState<any>(null);
@@ -836,6 +884,111 @@ export function SettingsPage() {
           <Text type="secondary">Loading sync status...</Text>
         )}
       </Card>
+
+      {/* Cloud Database Persistence (Clever Cloud Cellar S3) - Active for SERVER */}
+      {(panelRole === 'SERVER' || s3Status?.configured) && (
+        <Card
+          title={<><CloudSyncOutlined className="mr-2 text-indigo-500" />Cloud Database Persistence (Clever Cloud Cellar S3)</>}
+          bordered={false}
+          className="shadow-sm mb-6"
+          extra={
+            s3Status?.configured ? (
+              <Tag color="success" icon={<CheckCircleOutlined />}>S3 Active & Synced</Tag>
+            ) : (
+              <Tag color="default">Not Configured</Tag>
+            )
+          }
+        >
+          <Alert
+            message="Auto-Restore on Startup & Real-Time Sync Active"
+            description="When deployed as a Docker container on Clever Cloud, container restarts normally discard local files. With Cellar S3 persistence enabled, the server automatically restores the database from S3 on startup, debounces and syncs every change in real time, and flushes before shutdown."
+            type={s3Status?.configured ? "success" : "info"}
+            showIcon
+            icon={<CloudSyncOutlined />}
+            className="mb-4"
+          />
+
+          {s3Status?.configured ? (
+            <>
+              <Descriptions size="small" bordered column={{ xs: 1, sm: 2, md: 3 }} className="mb-4">
+                <Descriptions.Item label="S3 Host">
+                  <code>{s3Status.host || 'cellar-c2.services.clever-cloud.com'}</code>
+                </Descriptions.Item>
+                <Descriptions.Item label="Bucket">
+                  <Tag color="blue">{s3Status.bucket || 'ble-tunnel-server-db'}</Tag>
+                </Descriptions.Item>
+                <Descriptions.Item label="Last Sync">
+                  <Space size={4}>
+                    <Badge status="processing" />
+                    <span>{s3Status.last_sync_ago || 'Never'}</span>
+                  </Space>
+                </Descriptions.Item>
+                <Descriptions.Item label="Sync Count">
+                  {s3Status.sync_count} syncs completed
+                </Descriptions.Item>
+                <Descriptions.Item label="Database Size">
+                  {s3Status.db_size_bytes ? `${(s3Status.db_size_bytes / 1024).toFixed(1)} KB` : 'N/A'}
+                </Descriptions.Item>
+                <Descriptions.Item label="Boot Restore">
+                  <Tag color={s3Status.restored_init ? 'green' : 'cyan'}>
+                    {s3Status.restored_init ? 'Restored on Boot' : 'Ready'}
+                  </Tag>
+                </Descriptions.Item>
+              </Descriptions>
+
+              <Row gutter={[16, 16]}>
+                <Col xs={24} md={12}>
+                  <Card type="inner" title="Immediate S3 Backup" size="small">
+                    <Text type="secondary" className="block mb-3">
+                      Forces an immediate WAL checkpoint and uploads the latest database snapshot to Cellar S3.
+                    </Text>
+                    <Button
+                      type="primary"
+                      icon={<CloudSyncOutlined />}
+                      loading={s3BackupLoading || s3Status.is_syncing}
+                      onClick={handleS3BackupNow}
+                      block
+                    >
+                      {s3BackupLoading ? 'Syncing to S3...' : 'Backup to S3 Now'}
+                    </Button>
+                  </Card>
+                </Col>
+                <Col xs={24} md={12}>
+                  <Card type="inner" title="Restore from S3" size="small">
+                    <Text type="secondary" className="block mb-3">
+                      Fetches the latest database backup directly from your Clever Cloud Cellar S3 bucket.
+                    </Text>
+                    <Popconfirm
+                      title="Restore from S3?"
+                      description="This will overwrite the current database with the latest backup in S3."
+                      onConfirm={handleS3RestoreNow}
+                      okText="Restore"
+                      cancelText="Cancel"
+                      okButtonProps={{ danger: true }}
+                    >
+                      <Button
+                        icon={<DownloadOutlined />}
+                        loading={s3RestoreLoading}
+                        block
+                        danger
+                      >
+                        {s3RestoreLoading ? 'Restoring...' : 'Restore from S3 Now'}
+                      </Button>
+                    </Popconfirm>
+                  </Card>
+                </Col>
+              </Row>
+            </>
+          ) : (
+            <Alert
+              message="Cellar S3 Credentials"
+              description="To enable cloud database persistence, set CELLAR_ADDON_HOST, CELLAR_ADDON_KEY_ID, and CELLAR_ADDON_KEY_SECRET environment variables on Clever Cloud."
+              type="warning"
+              showIcon
+            />
+          )}
+        </Card>
+      )}
 
       <Card
         title={<><DatabaseOutlined className="mr-2" />Backup & Restore</>}

@@ -412,6 +412,8 @@ Whenever a change is introduced to this repository:
 | 2026-09-07 | Antigravity AI | `internal/dns/`, `internal/api/`, `web/src/` | Implemented high-performance concurrent DNS Speed Benchmark & Auto-Optimizer: ported Python DNS benchmark to native Go (`internal/dns/benchmark.go`), testing 42 curated DNS servers across Google and Bale SFU gateways (`meet-gwbm[1..6].ble.ir`). Added `/api/dns/benchmark/start`, `/api/dns/benchmark/status`, `/api/dns/benchmark/stop` REST endpoints, live benchmark scanner UI on SettingsPage with per-gateway latency breakdown, and 1-click Primary/Secondary DNS installation. Set default UI theme to light mode in `ThemeContext.tsx`. |
 | 2026-09-07 | Antigravity AI | Production Deployment (`192.168.2.150`) | Deployed updated project to local Proxmox container (`192.168.2.150` / `webrtc-proxy`): backed up existing deployment and SQLite database to `/root/vpn/ble-webrtc-tun.backup-20260907`, synchronized latest code and pre-compiled assets via rsync, compiled native Linux x86_64 binaries (`bin/client`, `bin/server`), verified `my-client.service` on boot, and validated live operation on port `:6681`. |
 | 2026-09-07 | Antigravity AI | `internal/s3sync/`, `internal/db/`, `cmd/server/`, `web/src/` | Implemented Cloud Database Persistence for Docker Server via Clever Cloud Cellar S3: built zero-dependency pure-Go AWS SigV4 S3 client (`internal/s3sync/`), automatic pre-startup database restoration from S3, real-time debounced change synchronization via GORM mutation callbacks, safe WAL checkpointing (`PRAGMA wal_checkpoint(FULL)`), graceful shutdown flush (`SIGTERM`/`SIGINT`), and Server Admin UI controls on SettingsPage. |
+| 2026-09-07 | Antigravity AI | `internal/db/`, `internal/api/`, `web/src/` | Implemented Database Factory Reset for Server & Client: created `d.ResetData()` purging accounts, pairings, connection logs, and sync events while strictly preserving application settings and admin user credentials. Added `POST /api/db/reset` and proxy `POST /api/remote/db/reset`, unhooking active sessions, backing up `.env.tokens`, debouncing S3 upload if on server, and adding a high-visibility Danger Zone in SettingsPage. |
+
 
 ---
 
@@ -443,8 +445,30 @@ Whenever a change is introduced to this repository:
     1. **Pre-Startup Restore:** Before `db.Init("server")` opens `data/server.db`, `s3sync.Restore` checks the bucket and downloads the latest snapshot. If found, the database starts pre-populated.
     2. **Real-Time Debounced Sync:** On any record creation, update, or deletion in GORM (`Account`, `Pairing`, `Setting`, `AdminUser`), GORM callbacks trigger `s3sync.NotifyChange()`. The syncer debounces updates (2s debounce, 15s max interval), calls `PRAGMA wal_checkpoint(FULL)`, and uploads `server.db` to S3.
     3. **Graceful Shutdown Flush:** On `SIGTERM` / `SIGINT`, the shutdown hook executes `s3sync.FlushSync()`, guaranteeing the final state is committed to S3.
-    4. **Server Admin Panel:** Renders S3 sync metrics, bucket details, and manual "Backup to S3 Now" / "Restore from S3 Now" triggers under `SettingsPage.tsx` exclusively when `ROLE=server`.
+    4. **Server Admin Panel:** Renders S3 sync metrics, bucket details, and manual "Backup to S3 Now" / "Restore from S3 Now" triggers under `SettingsPage.tsx` exclusively when `ROLE=server`.---
 
+## 10. Database Factory Reset Architecture (Server & Client)
 
-
+- **Purpose:** Allows administrators to perform a clean slate wipe of operational tunnel data (accounts, pairings, logs, sync events) on demand from the Web UI Settings page without destroying configuration, admin login credentials, or Bale connection settings.
+- **Database Engine Implementation (`internal/db/database.go`):**
+  - Method: `d.ResetData() (*ResetStats, error)`
+  - Foreign Key Safety: Wraps execution in `PRAGMA foreign_keys = OFF` and a transaction, deleting in dependency order (`connection_logs` -> `pairings` -> `events` -> `accounts`) via `.Unscoped().Where("1 = 1").Delete()`.
+  - **Strictly Preserved Tables:**
+    - `settings`: Preserves Bale gRPC/WS endpoints, livekit origins, DNS configurations, SOCKS/HTTP proxy ports, UI theme, Server Sync URL, and auth tokens.
+    - `admin_users`: Preserves administrative credentials and bcrypt password hashes.
+  - **WAL Checkpointing & S3 Synchronization:**
+    - Invokes `d.triggerMutation()`, automatically alerting `s3sync.Syncer` on Docker Server deployments.
+    - Executes `d.CheckpointWAL()` (`PRAGMA wal_checkpoint(FULL)`) ensuring the emptied SQLite database file on disk is immediately ready for transfer.
+- **API Endpoints (`internal/api/`):**
+  - `POST /api/db/reset`:
+    1. Invokes `s.OnForceEndCall()` to terminate any active WebRTC/Bale calls and release router sessions.
+    2. Renames legacy token import files (`.env.tokens` -> `.env.tokens.bak-<timestamp>`) preventing automatic resurrection of deleted accounts upon service restart.
+    3. Calls `d.ResetData()`.
+    4. Triggers `s.S3Syncer.SyncNow()` asynchronously on server instances.
+    5. Returns JSON response containing deleted record counts (`accounts_deleted`, `pairings_deleted`, `logs_deleted`, `events_deleted`).
+  - `POST /api/remote/db/reset`: Proxies the factory reset command to the remote Clever Cloud server utilizing configured `server_url` and `server_api_token`.
+- **Frontend UI (`web/src/components/pages/SettingsPage.tsx`):**
+  - Dedicated "Danger Zone / Reset Database (Factory Clean)" section with high-visibility warning banners.
+  - Two-stage confirmation dialogs (`Popconfirm`) to prevent accidental purges.
+  - Provides dual actions: **Reset Local Database** (current instance) and **Reset Remote Server Database** (connected Clever Cloud server).
 

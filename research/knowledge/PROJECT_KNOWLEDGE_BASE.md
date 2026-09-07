@@ -472,3 +472,29 @@ Whenever a change is introduced to this repository:
   - Two-stage confirmation dialogs (`Popconfirm`) to prevent accidental purges.
   - Provides dual actions: **Reset Local Database** (current instance) and **Reset Remote Server Database** (connected Clever Cloud server).
 
+---
+
+## 11. Server-Side Bale Dedicated Split-DNS & WebRTC Acceleration
+
+- **Problem & Motivation:**
+  - When the server runs in Docker on Clever Cloud (hosted abroad), resolving domestic Iranian Bale infrastructure (`web.bale.ir`, `meet-gwbm[1..6].ble.ir`, `meet-turn.ble.ir`) through Clever Cloud's default host OS DNS often suffers from high routing latency, packet loss, or DNS poisoning.
+  - However, resolving **global internet traffic** (when the server acts as an egress proxy for clients in `handleQUICStream`) through domestic Iranian DNS would be counterproductive or broken.
+  - Furthermore, Clever Cloud internal services (such as Cellar S3 persistence at `cellar-c2.services.clever-cloud.com`) must strictly use the native host DNS.
+- **Solution — Isolated Bale Dedicated Split-DNS:**
+  - **Selective Injection:**
+    - `bale.SetAppDialContext(serverResolver.DialContext)` intercepts all Bale signaling WebSocket, scraping, and gRPC-Web connections.
+    - `livekit.SetAppDialContext(serverResolver.DialContext)` intercepts all LiveKit SFU signaling WebSocket dials (`wss://meet-gwbm*.ble.ir/rtc`).
+    - `livekit.SetAppNet(pionNet)` injects a custom `transport.Net` wrapping `stdnet.Net` into Pion WebRTC's `SettingEngine`, intercepting `ResolveTCPAddr`, `ResolveUDPAddr`, `ResolveIPAddr`, and `Dial` for all STUN/TURN hostnames and ICE candidate checks.
+    - `livekit.ResolveICEURLs` pre-resolves STUN/TURN URLs returned in `joinResp.GetIceServers()` directly into optimal IP addresses.
+  - **Preserved Native Host DNS:**
+    - Client proxy traffic relay in `handleQUICStream` uses standard `net.DialTimeout("tcp", targetAddr, 5*time.Second)` over the host's native OS resolver.
+    - S3 synchronization in `internal/s3sync/` uses standard `http.Client` over the host's native OS resolver.
+- **Dynamic Hot-Swap & 1-Click Reset to Native:**
+  - `POST /api/routing/settings` on the server hot-swaps `serverResolver.SetServers(primary, secondary)`.
+  - When `primary == "" && secondary == ""` (or when the user clicks **Reset to Native DNS**):
+    - `bale.SetAppDialContext(nil)`, `livekit.SetAppDialContext(nil)`, `livekit.SetAppNet(nil)` are called.
+    - The server immediately reverts to 100% native host OS resolution, restoring default behavior without service interruption.
+- **DNS Speed Benchmark & Auto-Optimizer on Server:**
+  - The server admin panel can run the 42-server DNS benchmark directly from Clever Cloud against `google.com` and all 6 domestic Bale Meet Gateways (`meet-gwbm1.ble.ir` to `meet-gwbm6.ble.ir`).
+  - Admins can click **"⚡ Auto-Apply Top 2"** to automatically apply the 2 lowest-latency DNS servers from Clever Cloud.
+

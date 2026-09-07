@@ -251,7 +251,7 @@ To conserve tunnel bandwidth and provide low-latency access to domestic Iranian 
 - Single-binary deployment without requiring C toolchains on deployment servers.
 - Schemas:
   - `accounts`: Bale credentials, roles (`CLIENT`, `SERVER`), status, and metadata.
-  - `pairings`: Client-to-server 1:1 mapping with `owner_id`.
+  - `pairings`: Client-to-server 1:1 mapping accessible globally across all accounts (legacy access control removed).
   - `connection_logs`: Historical session statistics, bytes transferred, termination reasons.
   - `events`: Append-only log for event-sourced synchronization.
   - `settings`: Key-value configuration store.

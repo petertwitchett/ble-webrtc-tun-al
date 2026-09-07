@@ -75,11 +75,11 @@ export const api = {
   remoteDBReset: () => request('/remote/db/reset', { method: 'POST' }),
   remoteSyncFromServer: () => request('/remote/sync-from-server', { method: 'POST' }),
 
-  listPairings: (ownerID?: string) => request('/pairings' + (ownerID ? `?owner_id=${ownerID}` : '')),
-  createPairing: (clientId: number, serverId: number, ownerID?: string) => request('/pairings', { method: 'POST', body: JSON.stringify({ client_account_id: clientId, server_account_id: serverId, owner_id: ownerID || '' }) }),
+  listPairings: () => request('/pairings'),
+  createPairing: (clientId: number, serverId: number) => request('/pairings', { method: 'POST', body: JSON.stringify({ client_account_id: clientId, server_account_id: serverId }) }),
   deletePairing: (id: number) => request(`/pairings/${id}`, { method: 'DELETE' }),
-  autoPair: (ownerID?: string) => request('/pairings/auto', { method: 'POST', body: JSON.stringify({ owner_id: ownerID || '' }) }),
-  availableServers: (ownerID?: string) => request('/accounts/available-servers' + (ownerID ? `?owner_id=${ownerID}` : '')),
+  autoPair: () => request('/pairings/auto', { method: 'POST' }),
+  availableServers: () => request('/accounts/available-servers'),
 
   getActive: () => request('/connections/active'),
   getHistory: (limit?: number) => request(`/connections/history?limit=${limit || 50}`),

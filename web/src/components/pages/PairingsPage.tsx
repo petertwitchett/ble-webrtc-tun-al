@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Card, Table, Button, Modal, Form, Select, Tag, Space, Typography, Popconfirm, message, Alert, Tooltip } from 'antd';
-import { LinkOutlined, ThunderboltOutlined, PlusOutlined, DeleteOutlined, SyncOutlined, UserOutlined, CloudUploadOutlined } from '@ant-design/icons';
+import { Card, Table, Button, Modal, Form, Select, Tag, Space, Typography, Popconfirm, message } from 'antd';
+import { LinkOutlined, ThunderboltOutlined, PlusOutlined, DeleteOutlined, CloudUploadOutlined } from '@ant-design/icons';
 import { api } from '../../api';
 
 const { Title, Text } = Typography;
@@ -8,63 +8,39 @@ const { Title, Text } = Typography;
 export function PairingsPage() {
   const [pairings, setPairings] = useState<any[]>([]);
   const [accounts, setAccounts] = useState<any[]>([]);
-  const [availableServers, setAvailableServers] = useState<any[]>([]);
+  const [serverAccounts, setServerAccounts] = useState<any[]>([]);
   const [showAdd, setShowAdd] = useState(false);
   const [loading, setLoading] = useState(false);
   const [panelRole, setPanelRole] = useState<string>('');
-  const [clientID, setClientID] = useState<string>('');
   const [form] = Form.useForm();
-
-  // Load client ID on mount
-  useEffect(() => {
-    api.getClientID().then(r => {
-      setClientID(r.client_id || '');
-    }).catch(() => {});
-  }, []);
 
   const load = useCallback(async () => {
     try {
-      const [p, a] = await Promise.all([
-        api.listPairings(clientID || undefined),
-        api.listAccounts()
+      const [p, a, s] = await Promise.all([
+        api.listPairings(),
+        api.listAccounts(),
+        api.listAccounts('SERVER'),
       ]);
       setPairings(p);
       setAccounts(a);
+      setServerAccounts(s);
     } catch (e: any) {
       message.error('Failed to load pairings');
     }
-  }, [clientID]);
+  }, []);
 
-  // Load available servers when opening the create modal
-  const loadAvailableServers = useCallback(async () => {
-    try {
-      const servers = await api.availableServers(clientID || undefined);
-      setAvailableServers(servers);
-    } catch {
-      // Fallback to all servers
-      const all = await api.listAccounts('SERVER');
-      setAvailableServers(all);
-    }
-  }, [clientID]);
-
-  // Detect panel role
+  // Detect panel role and load initial data
   useEffect(() => {
     api.syncStatus().then(s => {
       setPanelRole(s.role === 'client' ? 'CLIENT' : 'SERVER');
     }).catch(() => {});
-  }, []);
-
-  // Load pairings: on CLIENT panels wait for clientID, on SERVER panels load all immediately
-  useEffect(() => {
-    if (panelRole === 'SERVER' || clientID !== '') {
-      load();
-    }
-  }, [load, clientID, panelRole]);
+    load();
+  }, [load]);
 
   const handleAdd = async (values: any) => {
     setLoading(true);
     try {
-      await api.createPairing(Number(values.clientId), Number(values.serverId), clientID);
+      await api.createPairing(Number(values.clientId), Number(values.serverId));
       message.success('Pairing created successfully');
       setShowAdd(false);
       form.resetFields();
@@ -78,7 +54,7 @@ export function PairingsPage() {
 
   const autoPair = async () => {
     try {
-      const r = await api.autoPair(clientID);
+      const r = await api.autoPair();
       message.success(`Auto-paired ${r.paired} accounts`);
       load();
     } catch (e: any) {
@@ -106,7 +82,7 @@ export function PairingsPage() {
   };
 
   const openAddModal = () => {
-    loadAvailableServers();
+    api.listAccounts('SERVER').then(setServerAccounts).catch(() => {});
     setShowAdd(true);
   };
 
@@ -194,9 +170,6 @@ export function PairingsPage() {
 
   const clients = accounts.filter((a: any) => a.role === 'CLIENT');
 
-  // Already-paired server IDs by THIS client — allowed in dropdown too (for reference)
-  const pairedServerIDs = new Set(pairings.map((p: any) => p.server_account_id));
-
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-end mb-8">
@@ -205,11 +178,6 @@ export function PairingsPage() {
           <Text type="secondary">
             Client ↔ Server account mappings
             {panelRole && <Tag color={panelRole === 'CLIENT' ? 'purple' : 'blue'} style={{ marginLeft: 8 }}>{panelRole} Panel</Tag>}
-            {clientID && (
-              <Tooltip title="Your unique client ID — other clients cannot use your paired servers">
-                <Tag icon={<UserOutlined />} color="geekblue" style={{ marginLeft: 4 }}>{clientID.slice(0, 8)}…</Tag>
-              </Tooltip>
-            )}
           </Text>
         </div>
         <Space>
@@ -221,15 +189,6 @@ export function PairingsPage() {
           </Button>
         </Space>
       </div>
-
-      <Alert
-        message="Multi-user pairing system"
-        description="Each client has a unique identity. Server accounts paired by you cannot be used by other clients. Available servers in the dropdown exclude those already paired by others."
-        type="info"
-        showIcon
-        icon={<SyncOutlined />}
-        className="mb-4"
-      />
 
       <Card bordered={false} className="shadow-sm">
         <Table
@@ -272,12 +231,11 @@ export function PairingsPage() {
               ))}
             </Select>
           </Form.Item>
-          <Form.Item name="serverId" label="Server Account (available only)" rules={[{ required: true, message: 'Please select a server account' }]}>
+          <Form.Item name="serverId" label="Server Account" rules={[{ required: true, message: 'Please select a server account' }]}>
             <Select placeholder="Select server...">
-              {availableServers.map((s: any) => (
+              {serverAccounts.map((s: any) => (
                 <Select.Option key={s.id} value={s.id}>
                   #{s.id} — {s.bale_user_id} {s.display_name ? `(${s.display_name})` : ''}
-                  {pairedServerIDs.has(s.id) ? ' ✓ (your pairing)' : ''}
                 </Select.Option>
               ))}
             </Select>

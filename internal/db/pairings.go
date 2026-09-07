@@ -26,12 +26,11 @@ func (d *Database) CreatePairing(clientAccountID, serverAccountID uint, ownerID 
 		return nil, fmt.Errorf("account %d is not a SERVER account", serverAccountID)
 	}
 
-	// Enforce exclusivity: server account must not be actively paired by another owner
+	// If this pairing already exists and is active, return it
 	var existingPairing Pairing
-	err := d.DB.Where("server_account_id = ? AND active = ? AND owner_id != ?", serverAccountID, true, ownerID).
-		First(&existingPairing).Error
-	if err == nil {
-		return nil, fmt.Errorf("server account %d is already paired by another client (owner: %s)", serverAccountID, existingPairing.OwnerID)
+	if err := d.DB.Where("client_account_id = ? AND server_account_id = ? AND active = ?", clientAccountID, serverAccountID, true).
+		First(&existingPairing).Error; err == nil {
+		return &existingPairing, nil
 	}
 
 	pairing := &Pairing{
@@ -136,19 +135,18 @@ func (d *Database) SetPairingActive(id uint, active bool) error {
 	return d.DB.Model(&Pairing{}).Where("id = ?", id).Update("active", active).Error
 }
 
-// AutoPairUnmatched automatically pairs unmatched client and server accounts
-// that belong to a specific owner.
+// AutoPairUnmatched automatically pairs unmatched client and server accounts globally.
 // Pairs them in order of creation (oldest first).
 // Returns the number of new pairings created.
 func (d *Database) AutoPairUnmatched(ownerID string) (int, error) {
 	var count int
 
 	err := d.DB.Transaction(func(tx *gorm.DB) error {
-		// Find unpaired client accounts belonging to this owner
+		// Find all unpaired enabled client accounts
 		var unpairedClients []Account
 		if err := tx.Where("role = ? AND enabled = ? AND id NOT IN (?)",
 			RoleClient, true,
-			tx.Model(&Pairing{}).Where("active = ? AND owner_id = ?", true, ownerID).Select("client_account_id"),
+			tx.Model(&Pairing{}).Where("active = ?", true).Select("client_account_id"),
 		).Order("created_at ASC").Find(&unpairedClients).Error; err != nil {
 			return err
 		}

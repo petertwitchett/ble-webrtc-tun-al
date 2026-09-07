@@ -621,17 +621,9 @@ func (tm *TunnelManager) StopAndEndCalls() (map[string]interface{}, error) {
 // Works even when the tunnel is not active (e.g. after a sudden disconnect).
 func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 	// Load pairings from database
-	pairings, err := tm.database.ListActivePairingsByOwner(tm.clientID)
+	pairings, err := tm.database.ListActivePairings()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load pairings: %w", err)
-	}
-
-	// Fallback: if no owner pairings, try all active pairings
-	if len(pairings) == 0 {
-		pairings, err = tm.database.ListActivePairings()
-		if err != nil {
-			return nil, fmt.Errorf("failed to load pairings: %w", err)
-		}
 	}
 
 	if len(pairings) == 0 {
@@ -752,24 +744,23 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 	}, nil
 }
 
-// loadPairsFromDB loads active pairings from the database scoped to this
-// client's owner ID, converts them to TokenPair format for initChannel.
+// loadPairsFromDB loads active pairings from the database, converts them to TokenPair format for initChannel.
 // If no pairings exist, it attempts auto-pairing first.
 func (tm *TunnelManager) loadPairsFromDB() ([]config.TokenPair, string, error) {
-	// First, check for active pairings belonging to this client
-	pairings, err := tm.database.ListActivePairingsByOwner(tm.clientID)
+	// Check for active pairings
+	pairings, err := tm.database.ListActivePairings()
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to load pairings: %w", err)
 	}
 
 	mode := "pairing"
 
-	// If no pairings for this owner, attempt auto-pairing (smart mode)
+	// If no pairings, attempt auto-pairing (smart mode)
 	if len(pairings) == 0 {
-		count, _ := tm.manager.AutoPairUnmatched(tm.clientID)
+		count, _ := tm.manager.AutoPairUnmatched("")
 		if count > 0 {
-			mainLog.Info("[Manager] Smart-paired %d accounts for client %s", count, tm.clientID)
-			pairings, _ = tm.database.ListActivePairingsByOwner(tm.clientID)
+			mainLog.Info("[Manager] Smart-paired %d accounts", count)
+			pairings, _ = tm.database.ListActivePairings()
 			mode = "smart"
 		}
 	}
@@ -791,9 +782,9 @@ func (tm *TunnelManager) loadPairsFromDB() ([]config.TokenPair, string, error) {
 			TargetUserID:     p.ServerAccount.BaleUserID,
 			ExpectedCallerID: p.ClientAccount.BaleUserID,
 		})
-		mainLog.Info("[Manager] Pair %d: client=%d (Bale %d) → server=%d (Bale %d) [owner=%s]",
+		mainLog.Info("[Manager] Pair %d: client=%d (Bale %d) → server=%d (Bale %d)",
 			i+1, p.ClientAccountID, p.ClientAccount.BaleUserID,
-			p.ServerAccountID, p.ServerAccount.BaleUserID, tm.clientID)
+			p.ServerAccountID, p.ServerAccount.BaleUserID)
 	}
 
 	if len(pairs) == 0 {
@@ -809,7 +800,7 @@ func (tm *TunnelManager) loadPairsFromDB() ([]config.TokenPair, string, error) {
 		if serverCount == 0 {
 			return nil, "", fmt.Errorf("no SERVER accounts found — server accounts are synced from the remote server. Check sync status")
 		}
-		return nil, "", fmt.Errorf("no active pairings for this client (ID=%s) — go to the Pairings page and create pairings or use Auto-Pair", tm.clientID)
+		return nil, "", fmt.Errorf("no active pairings found — go to the Pairings page and create pairings or use Auto-Pair")
 	}
 
 	return pairs, mode, nil

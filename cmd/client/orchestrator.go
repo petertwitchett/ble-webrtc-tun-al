@@ -168,7 +168,11 @@ func (tm *TunnelManager) endCallForPair(ctx context.Context, tp config.TokenPair
 drained:
 
 	mainLog.Info("[%s] ENDCALL: sending to %d", label, tp.TargetUserID)
-	if err := client.SendTextMessage(tp.TargetUserID, "BLETUN:ENDCALL"); err != nil {
+	endMsg := "BLETUN:ENDCALL"
+	if tp.ExpectedCallerID > 0 {
+		endMsg = fmt.Sprintf("BLETUN:ENDCALL:%d", tp.ExpectedCallerID)
+	}
+	if err := client.SendTextMessage(tp.TargetUserID, endMsg); err != nil {
 		mainLog.Warn("[%s] ENDCALL: send failed: %v", label, err)
 		if isTransient {
 			client.Close()
@@ -187,7 +191,7 @@ drained:
 			}
 			return false
 		case msg := <-client.TextMsgCh:
-			if msg == "BLETUN:ENDCALL_ACK" {
+			if msg == "BLETUN:ENDCALL_ACK" || strings.HasPrefix(msg, "BLETUN:ENDCALL_ACK") {
 				mainLog.Info("[%s] ENDCALL: ACK received — server is IDLE", label)
 				time.Sleep(500 * time.Millisecond)
 				client.CleanupMessages()

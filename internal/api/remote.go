@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 )
@@ -458,8 +459,9 @@ func (s *Server) handleRemoteSyncFromServer(w http.ResponseWriter, r *http.Reque
 	}
 
 	var snapshot struct {
-		Version  int64 `json:"version"`
-		Accounts []struct {
+		Version           int64  `json:"version"`
+		ObfuscationSecret string `json:"obfuscation_secret"`
+		Accounts          []struct {
 			BaleUserID  int64  `json:"bale_user_id"`
 			Role        string `json:"role"`
 			DisplayName string `json:"display_name"`
@@ -487,6 +489,12 @@ func (s *Server) handleRemoteSyncFromServer(w http.ResponseWriter, r *http.Reque
 	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
 		writeError(w, http.StatusBadGateway, "failed to decode server snapshot")
 		return
+	}
+
+	if snapshot.ObfuscationSecret != "" {
+		_ = s.database.SetSetting("obfuscation_secret", snapshot.ObfuscationSecret)
+		_ = os.Setenv("OBFUSCATION_SECRET", snapshot.ObfuscationSecret)
+		apiLog.Info("Synced obfuscation_secret from server")
 	}
 
 	accountsInserted := 0
@@ -583,8 +591,22 @@ func (s *Server) proxyToRemote(method, path string, body io.Reader) (*http.Respo
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 
-	// Use the same hardcoded admin credentials for the remote server
-	auth := base64.StdEncoding.EncodeToString([]byte("salman:Salman136517"))
+	// Use configured or default admin credentials for the remote server
+	authUser := os.Getenv("REMOTE_SERVER_USER")
+	if authUser == "" {
+		authUser = os.Getenv("ADMIN_USER")
+	}
+	if authUser == "" {
+		authUser = "azam"
+	}
+	authPass := os.Getenv("REMOTE_SERVER_PASS")
+	if authPass == "" {
+		authPass = os.Getenv("ADMIN_PASS")
+	}
+	if authPass == "" {
+		authPass = "136517"
+	}
+	auth := base64.StdEncoding.EncodeToString([]byte(authUser + ":" + authPass))
 	req.Header.Set("Authorization", "Basic "+auth)
 	req.Header.Set("Content-Type", "application/json")
 

@@ -301,6 +301,14 @@ func (s *Server) handleTunnelForceEndCall(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
+	if s.database != nil {
+		_ = s.database.ResetAllStatuses()
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"message": "all account statuses reset to IDLE",
+			"status":  "success",
+		})
+		return
+	}
 	writeError(w, http.StatusNotImplemented, "force end call not available")
 }
 

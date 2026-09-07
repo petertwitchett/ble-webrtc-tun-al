@@ -118,8 +118,13 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		result := make(map[string]string)
-		for _, s := range settings {
-			result[s.Key] = s.Value
+		for _, set := range settings {
+			result[set.Key] = set.Value
+		}
+		if _, ok := result["obfuscation_secret"]; !ok {
+			if envSec := os.Getenv("OBFUSCATION_SECRET"); envSec != "" {
+				result["obfuscation_secret"] = envSec
+			}
 		}
 		writeJSON(w, http.StatusOK, result)
 
@@ -139,6 +144,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if err := s.database.SetSetting(req.Key, req.Value); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if req.Key == "obfuscation_secret" {
+			os.Setenv("OBFUSCATION_SECRET", req.Value)
 		}
 		if strings.HasPrefix(req.Key, "bale.") {
 			bale.LoadFromSettings(s.database)

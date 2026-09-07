@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/salman/ble-webrtc-tun/internal/db"
 )
 
 // handleActiveConnections handles GET /api/connections/active.
@@ -78,18 +80,21 @@ func (s *Server) handleForceEndCall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	session := s.router.GetSession(uint(id))
-	if session == nil {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("no active session for server account %d", id))
-		return
+	var callID int64
+	if session != nil {
+		callID = session.CallID
+		s.router.ForceEndCall(uint(id))
+		apiLog.Info("Admin force-ended call for server account %d (callID=%d)", id, session.CallID)
+	} else {
+		// Even if no active memory session exists, reset stuck account in DB
+		s.database.SetAccountStatus(uint(id), db.StatusIdle)
+		apiLog.Info("Admin reset server account %d status to idle (no active in-memory session)", id)
 	}
-
-	s.router.ForceEndCall(uint(id))
-	apiLog.Info("Admin force-ended call for server account %d (callID=%d)", id, session.CallID)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":           "call ended",
 		"server_account_id": id,
-		"call_id":           session.CallID,
+		"call_id":           callID,
 	})
 }
 
@@ -108,10 +113,21 @@ func (s *Server) handleForceEndAllCalls(w http.ResponseWriter, r *http.Request) 
 		s.router.ForceEndCall(session.ServerAccountID)
 	}
 
-	apiLog.Info("Admin force-ended ALL calls (%d sessions)", count)
+	// Also reset any accounts stuck in IN_CALL or RESERVED state in the DB
+	accounts, _ := s.database.ListAccounts("")
+	resetCount := 0
+	for _, a := range accounts {
+		if a.Status == db.StatusInCall || a.Status == db.StatusReserved {
+			s.database.SetAccountStatus(a.ID, db.StatusIdle)
+			resetCount++
+		}
+	}
+
+	apiLog.Info("Admin force-ended ALL calls (%d active sessions, %d DB accounts reset)", count, resetCount)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"message": fmt.Sprintf("%d calls ended", count),
-		"count":   count,
+		"message":        fmt.Sprintf("%d calls ended, %d accounts reset", count, resetCount),
+		"count":          count,
+		"accounts_reset": resetCount,
 	})
 }

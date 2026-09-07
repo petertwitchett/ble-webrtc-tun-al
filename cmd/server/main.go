@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -126,6 +127,23 @@ func main() {
 		Username: cfg.AdminUsername,
 		Password: cfg.AdminPassword,
 	})
+	apiSrv.OnForceEndCall = func() (map[string]interface{}, error) {
+		sessions := callRouter.GetAllSessions()
+		ended := 0
+		for _, s := range sessions {
+			callRouter.ForceEndCall(s.ServerAccountID)
+			ended++
+		}
+		if err := serverDB.ResetAllStatuses(); err != nil {
+			mainLog.Warn("Failed to reset statuses: %v", err)
+		}
+		adminPanel.AddLog("info", fmt.Sprintf("ForceEndCall: ended %d sessions, all accounts reset to IDLE", ended))
+		return map[string]interface{}{
+			"ended_sessions": ended,
+			"status":         "all accounts reset to IDLE",
+		}, nil
+	}
+
 	// Wire signaling forwarding from the new API server to the admin panel
 	apiSrv.SetAdminPanel(adminPanel)
 	go func() {
@@ -145,16 +163,9 @@ func main() {
 	}
 
 	// Obfuscation: XChaCha20-Poly1305 over RTP payloads.
-	// With QUIC (TLS 1.3) + WebRTC (DTLS/SRTP) the data is already triple-encrypted.
-	// Leave OBFUSCATION_SECRET empty for maximum speed — 40 bytes/pkt saved + less CPU.
-	if cfg.ObfuscationSecret != "" {
-		var err error
-		serverObf, err = dcconn.NewObfuscator(cfg.ObfuscationSecret)
-		if err != nil {
-			mainLog.Error("Failed to create obfuscator: %v (running without obfuscation)", err)
-		} else {
-			mainLog.Warn("⚠️  XChaCha20 obfuscation ENABLED — REDUNDANT with QUIC+SRTP. Costs 40 bytes/pkt + CPU. Unset OBFUSCATION_SECRET for max speed.")
-		}
+	serverObf = getServerObfuscator(cfg)
+	if serverObf != nil {
+		mainLog.Warn("⚠️  XChaCha20 obfuscation ENABLED — REDUNDANT with QUIC+SRTP. Costs 40 bytes/pkt + CPU. Unset OBFUSCATION_SECRET for max speed.")
 	} else {
 		mainLog.Info("✅ Obfuscation disabled — QUIC TLS 1.3 + DTLS/SRTP provides full encryption. Full MTU available.")
 	}
@@ -163,6 +174,28 @@ func main() {
 	// Hot-reload: will automatically detect new server accounts added via admin panel
 	adminPanel.AddLog("info", "Bale signaling mode enabled (hot-reload)")
 	runBaleSignaling(ctx, cfg, adminPanel, wrtc, useTUN)
+}
+
+// getServerObfuscator resolves the obfuscation secret from config, database settings, or environment.
+func getServerObfuscator(cfg *config.Config) *dcconn.Obfuscator {
+	secret := cfg.ObfuscationSecret
+	if secret == "" && serverDB != nil {
+		if s, err := serverDB.GetSetting("obfuscation_secret"); err == nil && s != "" {
+			secret = s
+		}
+	}
+	if secret == "" {
+		secret = os.Getenv("OBFUSCATION_SECRET")
+	}
+	if secret != "" {
+		obf, err := dcconn.NewObfuscator(secret)
+		if err != nil {
+			mainLog.Error("Failed to create obfuscator: %v (running without obfuscation)", err)
+			return nil
+		}
+		return obf
+	}
+	return nil
 }
 
 // runBaleSignaling connects to Bale WS, waits for calls, auto-accepts, and tunnels.
@@ -515,6 +548,26 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 	callCh := client.GetCallCh()
 	sessionNum := 0
 
+	lookupCaller := func(rawMsg string) int64 {
+		if strings.HasPrefix(rawMsg, "BLETUN:ENDCALL:") {
+			parts := strings.Split(rawMsg, ":")
+			if len(parts) >= 3 {
+				if id, err := strconv.ParseInt(parts[2], 10, 64); err == nil && id > 0 {
+					return id
+				}
+			}
+		}
+		if sess := callRouter.GetSession(account.ID); sess != nil {
+			if cl, err := serverDB.GetAccount(sess.ClientAccountID); err == nil && cl != nil && cl.BaleUserID > 0 {
+				return cl.BaleUserID
+			}
+		}
+		if pairing, err := serverDB.GetPairingByServerAccount(account.ID); err == nil && pairing != nil && pairing.ClientAccount != nil && pairing.ClientAccount.BaleUserID > 0 {
+			return pairing.ClientAccount.BaleUserID
+		}
+		return expectedCallerID
+	}
+
 	for {
 		// Drain stale tunnel messages but preserve terminal messages
 		drainDone := false
@@ -523,18 +576,18 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 			case msg := <-client.TextMsgCh:
 				// Process terminal messages, drop stale tunnel messages
 				if strings.HasPrefix(msg, "BLECMD:") || strings.HasPrefix(msg, "BLERSZ:") || strings.HasPrefix(msg, "BLEEND:") {
-					// Terminal relay removed — commands now go via VPN proxy
 					continue
 				}
 				// Handle ENDCALL while draining — ACK immediately
-				if msg == "BLETUN:ENDCALL" && expectedCallerID != 0 {
-					mainLog.Info("%s Received ENDCALL while draining — sending ACK", label)
+				if strings.HasPrefix(msg, "BLETUN:ENDCALL") {
+					caller := lookupCaller(msg)
+					mainLog.Info("%s Received ENDCALL while draining — sending ACK to %d", label, caller)
 					adminPanel.AddLog("info", label+" 📴 ENDCALL received (idle) — sending ACK")
-					client.SendTextMessage(expectedCallerID, "BLETUN:ENDCALL_ACK")
-					// Also force-end in router + set IDLE (in case of stale state)
+					if caller != 0 {
+						client.SendTextMessage(caller, "BLETUN:ENDCALL_ACK")
+					}
 					callRouter.ForceEndCall(account.ID)
 					serverDB.SetAccountStatus(account.ID, db.StatusIdle)
-					// Async cleanup — don't block the main loop
 					go client.CleanupMessages()
 				}
 			default:
@@ -556,21 +609,18 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 				}
 				call = c
 			case msg := <-client.TextMsgCh:
-				// Handle terminal relay messages while waiting for calls
 				if strings.HasPrefix(msg, "BLECMD:") || strings.HasPrefix(msg, "BLERSZ:") || strings.HasPrefix(msg, "BLEEND:") {
-					// Terminal relay removed — commands now go via VPN proxy
 					continue
 				}
-				// Handle ENDCALL while waiting for calls (server is idle, no active call)
-				// Send ACK so the client knows the server is ready
-				if msg == "BLETUN:ENDCALL" && expectedCallerID != 0 {
-					mainLog.Info("%s Received ENDCALL while idle — sending ACK", label)
+				if strings.HasPrefix(msg, "BLETUN:ENDCALL") {
+					caller := lookupCaller(msg)
+					mainLog.Info("%s Received ENDCALL while idle — sending ACK to %d", label, caller)
 					adminPanel.AddLog("info", label+" 📴 ENDCALL received (idle) — sending ACK")
-					client.SendTextMessage(expectedCallerID, "BLETUN:ENDCALL_ACK")
-					// Also force-end in router + set IDLE (in case of stale state)
+					if caller != 0 {
+						client.SendTextMessage(caller, "BLETUN:ENDCALL_ACK")
+					}
 					callRouter.ForceEndCall(account.ID)
 					serverDB.SetAccountStatus(account.ID, db.StatusIdle)
-					// Async cleanup — don't block the main loop
 					go client.CleanupMessages()
 				}
 				continue
@@ -643,7 +693,12 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 		}
 		mainLog.Info("%s Connecting to LiveKit SFU...", tag)
 
-		sfuTransport := livekit.NewSFUTransport(&sessionCfg, serverObf)
+		actualCallerID := call.CallerID
+		if actualCallerID == 0 {
+			actualCallerID = lookupCaller("")
+		}
+
+		sfuTransport := livekit.NewSFUTransport(&sessionCfg, getServerObfuscator(cfg))
 		if err := sfuTransport.Connect(sessionCtx); err != nil {
 			adminPanel.AddLog("error", tag+" SFU connect failed: "+err.Error())
 			mainLog.Error("%s SFU connect failed: %v", tag, err)
@@ -655,12 +710,14 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 		}
 		adminPanel.AddLog("info", tag+" ✅ SFU connected!")
 
-		// Run tunnel session in goroutine
+		// Run tunnel session in goroutine and coordinate cleanly
+		sessionDone := make(chan struct{})
 		go func(sctx context.Context, scancel context.CancelFunc, sfu *livekit.SFUTransport, sTag string, cID int64, sNum int, sess *router.Session) {
+			defer close(sessionDone)
 			defer scancel()
 			defer sfu.Close()
 
-			handleSFUProxy(sctx, cfg, sfu, adminPanel, client, sTag, expectedCallerID)
+			handleSFUProxy(sctx, cfg, sfu, adminPanel, client, sTag, actualCallerID)
 
 			mainLog.Info("%s Tunnel ended — cleaning up", sTag)
 			adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
@@ -682,6 +739,48 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 			client.CleanupMessages()
 			mainLog.Info("%s ✅ Cleanup done", sTag)
 		}(sessionCtx, sessionCancel, sfuTransport, tag, call.CallID, sessionNum, session)
+
+		// Synchronize: while session is running, monitor for ENDCALL/END from client or context cancel
+		sessionActive := true
+		for sessionActive {
+			select {
+			case <-ctx.Done():
+				sessionCancel()
+				sessionActive = false
+			case <-sessionDone:
+				sessionActive = false
+			case msg := <-client.TextMsgCh:
+				if strings.HasPrefix(msg, "BLETUN:ENDCALL") {
+					caller := lookupCaller(msg)
+					if caller == 0 {
+						caller = actualCallerID
+					}
+					mainLog.Info("%s 📴 Received ENDCALL during active session — terminating session and sending ACK to %d", tag, caller)
+					adminPanel.AddLog("info", tag+" 📴 ENDCALL received — terminating session")
+					sessionCancel()
+					client.DiscardCall(call.CallID)
+					callRouter.ForceEndCall(account.ID)
+					serverDB.SetAccountStatus(account.ID, db.StatusIdle)
+					if caller != 0 {
+						client.SendTextMessage(caller, "BLETUN:ENDCALL_ACK")
+					}
+					select {
+					case <-sessionDone:
+					case <-time.After(3 * time.Second):
+					}
+					sessionActive = false
+				} else if msg == "BLETUN:END" || strings.HasPrefix(msg, "BLETUN:END") {
+					mainLog.Info("%s Client sent BLETUN:END — terminating session", tag)
+					adminPanel.AddLog("info", tag+" Client sent END")
+					sessionCancel()
+					select {
+					case <-sessionDone:
+					case <-time.After(3 * time.Second):
+					}
+					sessionActive = false
+				}
+			}
+		}
 
 		time.Sleep(1 * time.Second)
 	}
@@ -751,6 +850,12 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	accCtx, accCancel := context.WithTimeout(ctx, acceptTimeout)
 	defer accCancel()
 
+	// Immediately close listener when context is cancelled so Accept unblocks instantly
+	go func() {
+		<-accCtx.Done()
+		listener.Close()
+	}()
+
 	qconn, err := listener.Accept(accCtx)
 	if err != nil {
 		adminPanel.AddLog("error", tag+" QUIC accept failed: "+err.Error())
@@ -789,7 +894,7 @@ drainLoop:
 			mainLog.Info("%s Context cancelled", tag)
 			return
 		case msg := <-baleClient.TextMsgCh:
-			if msg == "BLETUN:END" {
+			if msg == "BLETUN:END" || strings.HasPrefix(msg, "BLETUN:END") {
 				if time.Since(sessionStart) < gracePeriod {
 					mainLog.Info("%s Ignoring stale BLETUN:END (within %v grace period)", tag, gracePeriod)
 					continue
@@ -798,7 +903,7 @@ drainLoop:
 				mainLog.Info("%s Client sent BLETUN:END", tag)
 				return
 			}
-			if msg == "BLETUN:ENDCALL" {
+			if strings.HasPrefix(msg, "BLETUN:ENDCALL") {
 				mainLog.Info("%s 📴 Received ENDCALL command — ending active call", tag)
 				adminPanel.AddLog("info", tag+" 📴 ENDCALL received — ending call and sending ACK")
 				if callerID != 0 {

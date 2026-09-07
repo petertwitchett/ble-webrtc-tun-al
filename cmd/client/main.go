@@ -290,14 +290,21 @@ func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accoun
 	clientID := getOrCreateClientID(database)
 	mainLog.Info("Client ID: %s", clientID)
 
-	// Obfuscation: XChaCha20-Poly1305 over the RTP payloads.
-	// NOTE: With QUIC (TLS 1.3) + WebRTC (DTLS/SRTP), the payload is already
-	// triple-encrypted. Leaving OBFUSCATION_SECRET empty is RECOMMENDED for
-	// maximum speed — it eliminates 40 bytes/pkt overhead and CPU cycles.
+	// Obfuscation: XChaCha20-Poly1305 over RTP payloads.
+	secret := cfg.ObfuscationSecret
+	if secret == "" && database != nil {
+		if s, err := database.GetSetting("obfuscation_secret"); err == nil && s != "" {
+			secret = s
+		}
+	}
+	if secret == "" {
+		secret = os.Getenv("OBFUSCATION_SECRET")
+	}
+
 	var obf *dcconn.Obfuscator
-	if cfg.ObfuscationSecret != "" {
+	if secret != "" {
 		var err error
-		obf, err = dcconn.NewObfuscator(cfg.ObfuscationSecret)
+		obf, err = dcconn.NewObfuscator(secret)
 		if err != nil {
 			mainLog.Error("Failed to create obfuscator: %v (running without obfuscation)", err)
 		} else {
@@ -316,6 +323,26 @@ func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accoun
 		refresh:    &refreshSupervisor{},
 		routing:    initRoutingEngine(cfg, database),
 	}
+}
+
+// getObfuscator dynamically retrieves the obfuscator based on config, DB settings, or env.
+func (tm *TunnelManager) getObfuscator() *dcconn.Obfuscator {
+	secret := tm.cfg.ObfuscationSecret
+	if secret == "" && tm.database != nil {
+		if s, err := tm.database.GetSetting("obfuscation_secret"); err == nil && s != "" {
+			secret = s
+		}
+	}
+	if secret == "" {
+		secret = os.Getenv("OBFUSCATION_SECRET")
+	}
+	if secret != "" {
+		obf, err := dcconn.NewObfuscator(secret)
+		if err == nil {
+			return obf
+		}
+	}
+	return nil
 }
 
 // routingSettingKeys are the DB setting keys for the application-level DNS and
@@ -576,7 +603,10 @@ func (tm *TunnelManager) Stop() {
 		}
 	}
 	tm.channelMu.Unlock()
-	mainLog.Info("[Manager] Tunnel stopped.")
+	mainLog.Info("[Manager] Tunnel stopped. Sending clean hangup to servers...")
+	go func() {
+		_, _ = tm.ForceEndCall()
+	}()
 }
 
 // ForceEndCall sends BLETUN:ENDCALL to all paired server accounts via Bale,
@@ -615,7 +645,7 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 		}
 
 		wg.Add(1)
-		go func(clientToken string, serverBaleID int64, pairingID uint) {
+		go func(clientToken string, clientBaleID, serverBaleID int64, pairingID uint) {
 			defer wg.Done()
 
 			result := map[string]interface{}{
@@ -642,9 +672,13 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 			client.StartPingLoop()
 			time.Sleep(1 * time.Second)
 
-			// Send ENDCALL command
+			// Send ENDCALL command with client Bale user ID
 			mainLog.Info("%s Sending ENDCALL to %d...", label, serverBaleID)
-			if err := client.SendTextMessage(serverBaleID, "BLETUN:ENDCALL"); err != nil {
+			endMsg := "BLETUN:ENDCALL"
+			if clientBaleID > 0 {
+				endMsg = fmt.Sprintf("BLETUN:ENDCALL:%d", clientBaleID)
+			}
+			if err := client.SendTextMessage(serverBaleID, endMsg); err != nil {
 				mainLog.Error("%s Failed to send ENDCALL: %v", label, err)
 				result["status"] = "send_failed"
 				result["error"] = err.Error()
@@ -662,7 +696,7 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 			for !ackReceived {
 				select {
 				case msg := <-client.TextMsgCh:
-					if msg == "BLETUN:ENDCALL_ACK" {
+					if msg == "BLETUN:ENDCALL_ACK" || strings.HasPrefix(msg, "BLETUN:ENDCALL_ACK") {
 						mainLog.Info("%s ✅ ACK received!", label)
 						ackReceived = true
 					} else {
@@ -675,7 +709,6 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 					mu.Lock()
 					results = append(results, result)
 					mu.Unlock()
-					// Still clean up messages
 					client.CleanupMessages()
 					return
 				}
@@ -693,7 +726,7 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 			mu.Lock()
 			results = append(results, result)
 			mu.Unlock()
-		}(p.ClientAccount.Token, p.ServerAccount.BaleUserID, p.ID)
+		}(p.ClientAccount.Token, p.ClientAccount.BaleUserID, p.ServerAccount.BaleUserID, p.ID)
 	}
 
 	wg.Wait()
@@ -747,9 +780,10 @@ func (tm *TunnelManager) loadPairsFromDB() ([]config.TokenPair, string, error) {
 			continue
 		}
 		pairs = append(pairs, config.TokenPair{
-			Index:        i + 1,
-			ClientToken:  p.ClientAccount.Token,
-			TargetUserID: p.ServerAccount.BaleUserID,
+			Index:            i + 1,
+			ClientToken:      p.ClientAccount.Token,
+			TargetUserID:     p.ServerAccount.BaleUserID,
+			ExpectedCallerID: p.ClientAccount.BaleUserID,
 		})
 		mainLog.Info("[Manager] Pair %d: client=%d (Bale %d) → server=%d (Bale %d) [owner=%s]",
 			i+1, p.ClientAccountID, p.ClientAccount.BaleUserID,
@@ -915,9 +949,14 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 			mu.Unlock()
 
 			for _, ch := range chs {
+				endMsg := "BLETUN:ENDCALL"
+				if ch.pair.ExpectedCallerID > 0 {
+					endMsg = fmt.Sprintf("BLETUN:ENDCALL:%d", ch.pair.ExpectedCallerID)
+				}
+				ch.client.SendTextMessage(ch.cfg.BaleTargetUserID, endMsg)
 				ch.client.SendTextMessage(ch.cfg.BaleTargetUserID, "BLETUN:END")
 			}
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 			for _, ch := range chs {
 				ch.client.CleanupMessages()
 				ch.sfu.Close()
@@ -1176,7 +1215,7 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 
 	tm.setChannelPhase(idx, PhaseSFUConnect, "")
 	mainLog.Info("[%s] Connecting to SFU...", label)
-	sfu := lk.NewSFUTransport(&chanCfg, tm.obfuscator)
+	sfu := lk.NewSFUTransport(&chanCfg, tm.getObfuscator())
 	if err := sfu.Connect(ctx); err != nil {
 		errStr := "SFU connection failed: " + err.Error()
 		tm.setChannelPhase(idx, PhaseError, errStr)

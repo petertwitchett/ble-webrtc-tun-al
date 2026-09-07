@@ -411,6 +411,7 @@ Whenever a change is introduced to this repository:
 | 2026-09-07 | Antigravity AI | `web/src/`, `internal/api/`, `cmd/client/` | Unified Disconnect & Server Call Termination: merged `Stop()` and `ForceEndCall()` into `StopAndEndCalls()` returning per-account termination results via `/api/tunnel/stop`. Synchronized Dashboard UI so clicking DISCONNECT immediately activates the ENDING status animation on the END CALLS button. Kept END CALLS button visible as a live status indicator (ENDED ✓ or RETRY END CALLS on failure) with click-to-retry enabled if any server accounts fail to disconnect. |
 | 2026-09-07 | Antigravity AI | `internal/dns/`, `internal/api/`, `web/src/` | Implemented high-performance concurrent DNS Speed Benchmark & Auto-Optimizer: ported Python DNS benchmark to native Go (`internal/dns/benchmark.go`), testing 42 curated DNS servers across Google and Bale SFU gateways (`meet-gwbm[1..6].ble.ir`). Added `/api/dns/benchmark/start`, `/api/dns/benchmark/status`, `/api/dns/benchmark/stop` REST endpoints, live benchmark scanner UI on SettingsPage with per-gateway latency breakdown, and 1-click Primary/Secondary DNS installation. Set default UI theme to light mode in `ThemeContext.tsx`. |
 | 2026-09-07 | Antigravity AI | Production Deployment (`192.168.2.150`) | Deployed updated project to local Proxmox container (`192.168.2.150` / `webrtc-proxy`): backed up existing deployment and SQLite database to `/root/vpn/ble-webrtc-tun.backup-20260907`, synchronized latest code and pre-compiled assets via rsync, compiled native Linux x86_64 binaries (`bin/client`, `bin/server`), verified `my-client.service` on boot, and validated live operation on port `:6681`. |
+| 2026-09-07 | Antigravity AI | `internal/s3sync/`, `internal/db/`, `cmd/server/`, `web/src/` | Implemented Cloud Database Persistence for Docker Server via Clever Cloud Cellar S3: built zero-dependency pure-Go AWS SigV4 S3 client (`internal/s3sync/`), automatic pre-startup database restoration from S3, real-time debounced change synchronization via GORM mutation callbacks, safe WAL checkpointing (`PRAGMA wal_checkpoint(FULL)`), graceful shutdown flush (`SIGTERM`/`SIGINT`), and Server Admin UI controls on SettingsPage. |
 
 ---
 
@@ -426,6 +427,24 @@ Whenever a change is introduced to this repository:
 - **Active Admin Panel:** `http://192.168.2.150:6681` (protected with Basic Auth)
 - **Preserved State:** `data/client.db` (containing all user accounts, active pairings, and server sync credentials)
 - **Build Tool:** `/usr/local/go/bin/go` (Go 1.26.3 linux/amd64)
+
+---
+
+## 9. Server SQLite S3 Persistence (Clever Cloud Cellar Object Storage)
+
+- **Problem:** When the server runs in Docker on Clever Cloud, container restarts or deployments discard the ephemeral container filesystem, losing all SQLite accounts, pairings, and settings.
+- **Solution:** Integrated native AWS SigV4 S3 persistence (`internal/s3sync/`) linked to Clever Cloud Cellar Addon:
+  - **Environment Configuration:**
+    - `CELLAR_ADDON_HOST`: `cellar-c2.services.clever-cloud.com`
+    - `CELLAR_ADDON_KEY_ID`: `J1B95ZC0ADI3PRASHSYS`
+    - `CELLAR_ADDON_KEY_SECRET`: `WbvNnIRc90mWquFXkHvXkJvN9WTXpnXwnHn9Dmx1`
+    - `CELLAR_ADDON_BUCKET_NAME` / default: `ble-tunnel-server-db`
+  - **Lifecycle:**
+    1. **Pre-Startup Restore:** Before `db.Init("server")` opens `data/server.db`, `s3sync.Restore` checks the bucket and downloads the latest snapshot. If found, the database starts pre-populated.
+    2. **Real-Time Debounced Sync:** On any record creation, update, or deletion in GORM (`Account`, `Pairing`, `Setting`, `AdminUser`), GORM callbacks trigger `s3sync.NotifyChange()`. The syncer debounces updates (2s debounce, 15s max interval), calls `PRAGMA wal_checkpoint(FULL)`, and uploads `server.db` to S3.
+    3. **Graceful Shutdown Flush:** On `SIGTERM` / `SIGINT`, the shutdown hook executes `s3sync.FlushSync()`, guaranteeing the final state is committed to S3.
+    4. **Server Admin Panel:** Renders S3 sync metrics, bucket details, and manual "Backup to S3 Now" / "Restore from S3 Now" triggers under `SettingsPage.tsx` exclusively when `ROLE=server`.
+
 
 
 

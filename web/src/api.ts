@@ -109,6 +109,12 @@ export const api = {
   updateRoutingSettings: (data: { dns_primary: string; dns_secondary: string; bypass_domains: string }) =>
     request('/routing/settings', { method: 'POST', body: JSON.stringify(data) }),
 
+  // DNS Speed Benchmark & Auto-Optimizer
+  dnsBenchmarkStart: (servers?: string[]) =>
+    request('/dns/benchmark/start', { method: 'POST', body: JSON.stringify({ servers: servers || [] }) }),
+  dnsBenchmarkStatus: () => request('/dns/benchmark/status'),
+  dnsBenchmarkStop: () => request('/dns/benchmark/stop', { method: 'POST' }),
+
   // Tunnel Controls
   tunnelStart: () => request('/tunnel/start', { method: 'POST' }),
   tunnelStop: () => request('/tunnel/stop', { method: 'POST' }),

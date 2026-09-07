@@ -199,6 +199,11 @@ func (s *Server) registerRoutes() {
 	// Routing configuration (application-level DNS + split-tunneling bypass)
 	s.mux.HandleFunc("/api/routing/settings", s.handleRoutingSettings)
 
+	// DNS Speed Benchmark & Auto-Optimizer
+	s.mux.HandleFunc("/api/dns/benchmark/start", s.handleDNSBenchmarkStart)
+	s.mux.HandleFunc("/api/dns/benchmark/status", s.handleDNSBenchmarkStatus)
+	s.mux.HandleFunc("/api/dns/benchmark/stop", s.handleDNSBenchmarkStop)
+
 	// Web Terminal (xterm.js)
 	s.mux.HandleFunc("/api/terminal/ws", s.handleTerminalWS)
 	s.mux.HandleFunc("/api/terminal/info", s.handleTerminalInfo)

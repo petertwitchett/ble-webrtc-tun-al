@@ -1,6 +1,16 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Card, Typography, Select, Button, Space, Row, Col, Tag, message, Descriptions, Badge, Alert, Upload, Divider, Input } from 'antd';
-import { SyncOutlined, CloudSyncOutlined, CheckCircleOutlined, DownloadOutlined, UploadOutlined, DatabaseOutlined, ExclamationCircleOutlined, LinkOutlined, GlobalOutlined, SafetyCertificateOutlined, ApiOutlined } from '@ant-design/icons';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import {
+  Card, Typography, Select, Button, Space, Row, Col, Tag, message,
+  Descriptions, Badge, Alert, Upload, Divider, Input, Table, Progress,
+  Popover, Switch
+} from 'antd';
+import {
+  SyncOutlined, CloudSyncOutlined, CheckCircleOutlined, DownloadOutlined,
+  UploadOutlined, DatabaseOutlined, ExclamationCircleOutlined, LinkOutlined,
+  GlobalOutlined, SafetyCertificateOutlined, ApiOutlined,
+  PlayCircleOutlined, StopOutlined, DashboardOutlined,
+  RocketOutlined, SearchOutlined
+} from '@ant-design/icons';
 import { useTheme, THEMES, MODES } from '../../ThemeContext';
 import { api } from '../../api';
 
@@ -30,6 +40,80 @@ export function SettingsPage() {
   const [baleSyncing, setBaleSyncing] = useState(false);
   const [routing, setRouting] = useState({ dns_primary: '', dns_secondary: '', bypass_domains: '' });
   const [routingSaving, setRoutingSaving] = useState(false);
+
+  // DNS Speed Benchmark state
+  const [benchmarkStatus, setBenchmarkStatus] = useState<any>(null);
+  const [benchmarkLoading, setBenchmarkLoading] = useState(false);
+  const [dnsSearch, setDnsSearch] = useState('');
+  const [onlineOnly, setOnlineOnly] = useState(true);
+
+  const pollBenchmark = useCallback(async () => {
+    try {
+      const res = await api.dnsBenchmarkStatus();
+      setBenchmarkStatus(res);
+      return res;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    pollBenchmark();
+  }, [pollBenchmark]);
+
+  // Polling loop when benchmark is active
+  useEffect(() => {
+    let timer: any = null;
+    if (benchmarkStatus?.running) {
+      timer = setInterval(async () => {
+        const res = await pollBenchmark();
+        if (res && !res.running) {
+          clearInterval(timer);
+        }
+      }, 1000);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [benchmarkStatus?.running, pollBenchmark]);
+
+  const handleStartBenchmark = async () => {
+    setBenchmarkLoading(true);
+    try {
+      await api.dnsBenchmarkStart();
+      message.success('DNS benchmark started — testing servers against Google and Bale Meet gateways...');
+      await pollBenchmark();
+    } catch (e: any) {
+      message.error(e.message || 'Failed to start benchmark');
+    } finally {
+      setBenchmarkLoading(false);
+    }
+  };
+
+  const handleStopBenchmark = async () => {
+    try {
+      await api.dnsBenchmarkStop();
+      message.info('DNS benchmark stopped');
+      await pollBenchmark();
+    } catch (e: any) {
+      message.error(e.message || 'Failed to stop benchmark');
+    }
+  };
+
+  const handleApplyDNS = async (primary: string, secondary: string) => {
+    const newRouting = {
+      dns_primary: primary,
+      dns_secondary: secondary,
+      bypass_domains: routing.bypass_domains,
+    };
+    try {
+      await api.updateRoutingSettings(newRouting);
+      setRouting(newRouting);
+      message.success(`Applied DNS: Primary=${primary} | Secondary=${secondary} — active traffic routing updated`);
+    } catch (e: any) {
+      message.error(e.message || 'Failed to apply DNS');
+    }
+  };
 
   const loadSyncStatus = useCallback(async () => {
     try {
@@ -107,6 +191,150 @@ export function SettingsPage() {
     }
   };
 
+
+  const topOnlineServers = useMemo(() => {
+    if (!benchmarkStatus?.results) return [];
+    return benchmarkStatus.results.filter((r: any) => r.online);
+  }, [benchmarkStatus?.results]);
+
+  const filteredResults = useMemo(() => {
+    if (!benchmarkStatus?.results) return [];
+    let list = benchmarkStatus.results;
+    if (onlineOnly) {
+      list = list.filter((r: any) => r.online);
+    }
+    if (dnsSearch.trim()) {
+      const q = dnsSearch.trim().toLowerCase();
+      list = list.filter((r: any) => r.ip.toLowerCase().includes(q));
+    }
+    return list;
+  }, [benchmarkStatus?.results, onlineOnly, dnsSearch]);
+
+  const dnsColumns = [
+    {
+      title: 'Rank',
+      key: 'rank',
+      width: 75,
+      render: (_: any, r: any) => {
+        if (!r.online) return <Tag color="default">Off</Tag>;
+        const colors: Record<number, string> = { 1: '#f59e0b', 2: '#94a3b8', 3: '#d97706' };
+        return (
+          <Tag color={colors[r.rank] || 'blue'} className="font-bold text-xs">
+            #{r.rank}
+          </Tag>
+        );
+      },
+    },
+    {
+      title: 'DNS Server IP',
+      dataIndex: 'ip',
+      key: 'ip',
+      render: (ip: string) => (
+        <Space size="small">
+          <Text strong className="font-mono text-sm">{ip}</Text>
+          {routing.dns_primary === ip && <Tag color="green">Primary</Tag>}
+          {routing.dns_secondary === ip && <Tag color="cyan">Secondary</Tag>}
+        </Space>
+      ),
+    },
+    {
+      title: 'Global Avg',
+      key: 'global_avg_ms',
+      sorter: (a: any, b: any) => (a.global_avg_ms > 0 ? a.global_avg_ms : 9999) - (b.global_avg_ms > 0 ? b.global_avg_ms : 9999),
+      render: (_: any, r: any) => {
+        if (!r.online || r.global_avg_ms < 0) return <Text type="secondary">—</Text>;
+        const color = r.global_avg_ms < 60 ? 'green' : r.global_avg_ms < 120 ? 'blue' : r.global_avg_ms < 200 ? 'orange' : 'red';
+        return <Tag color={color} className="font-semibold">{r.global_avg_ms} ms</Tag>;
+      },
+    },
+    {
+      title: 'Bale Meet Gateways',
+      key: 'bale_avg_ms',
+      sorter: (a: any, b: any) => (a.bale_avg_ms > 0 ? a.bale_avg_ms : 9999) - (b.bale_avg_ms > 0 ? b.bale_avg_ms : 9999),
+      render: (_: any, r: any) => {
+        if (!r.online || r.bale_avg_ms < 0) return <Text type="secondary">—</Text>;
+        const content = (
+          <div className="text-xs p-1 space-y-1 font-mono">
+            <div className="font-bold border-b pb-1 mb-1">Meet Gateways (meet-gwbm[1..6].ble.ir):</div>
+            {[1, 2, 3, 4, 5, 6].map((i) => {
+              const val = r.bale_gateways?.[`B${i}`];
+              return (
+                <div key={i} className="flex justify-between gap-4">
+                  <span className="text-slate-500">Gateway {i}:</span>
+                  <span className={val > 0 ? 'text-emerald-600 font-bold' : 'text-rose-500'}>
+                    {val > 0 ? `${val} ms` : 'Failed'}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        );
+        return (
+          <Popover content={content} title="Gateway Latency Breakdown" trigger="hover">
+            <Tag color="cyan" className="cursor-pointer font-semibold">
+              {r.bale_avg_ms} ms (B1-B6 ℹ)
+            </Tag>
+          </Popover>
+        );
+      },
+    },
+    {
+      title: 'Google',
+      key: 'google_avg_ms',
+      render: (_: any, r: any) => {
+        if (!r.online || r.google_avg_ms < 0) return <Text type="secondary">X</Text>;
+        return <Text className="font-mono text-xs">{r.google_avg_ms} ms</Text>;
+      },
+    },
+    {
+      title: 'Reliability',
+      dataIndex: 'reliability',
+      key: 'reliability',
+      sorter: (a: any, b: any) => a.reliability - b.reliability,
+      render: (val: number, r: any) => {
+        if (!r.online) return <Tag color="error">0%</Tag>;
+        const color = val === 100 ? 'success' : val >= 80 ? 'processing' : 'warning';
+        return <Tag color={color} className="font-semibold">{val}%</Tag>;
+      },
+    },
+    {
+      title: 'Score',
+      dataIndex: 'score',
+      key: 'score',
+      sorter: (a: any, b: any) => a.score - b.score,
+      render: (val: number, r: any) => {
+        if (!r.online || val >= 1000000) return <Text type="secondary">—</Text>;
+        return <Text className="font-mono text-xs">{val}</Text>;
+      },
+    },
+    {
+      title: 'Actions',
+      key: 'actions',
+      render: (_: any, r: any) => {
+        if (!r.online) return null;
+        return (
+          <Space size="small">
+            <Button
+              size="small"
+              type={routing.dns_primary === r.ip ? 'primary' : 'default'}
+              onClick={() => handleApplyDNS(r.ip, routing.dns_secondary)}
+              title="Set as Primary DNS"
+            >
+              Primary
+            </Button>
+            <Button
+              size="small"
+              type={routing.dns_secondary === r.ip ? 'primary' : 'default'}
+              onClick={() => handleApplyDNS(routing.dns_primary, r.ip)}
+              title="Set as Secondary DNS"
+            >
+              Secondary
+            </Button>
+          </Space>
+        );
+      },
+    },
+  ];
 
   return (
     <div className="space-y-6">
@@ -349,6 +577,112 @@ export function SettingsPage() {
             </Text>
           </Col>
         </Row>
+      </Card>
+
+      {/* DNS Speed Benchmark & Auto-Optimizer */}
+      <Card
+        title={
+          <div className="flex items-center gap-2">
+            <DashboardOutlined />
+            <span>DNS Speed Benchmark &amp; Auto-Optimizer</span>
+            {benchmarkStatus?.running && (
+              <Tag color="processing" className="animate-pulse">
+                SCANNING ({benchmarkStatus.percent}%)
+              </Tag>
+            )}
+          </div>
+        }
+        bordered={false}
+        className="shadow-sm mb-6"
+        extra={
+          <Space>
+            {topOnlineServers.length >= 2 && !benchmarkStatus?.running && (
+              <Button
+                type="dashed"
+                icon={<RocketOutlined />}
+                onClick={() => handleApplyDNS(topOnlineServers[0].ip, topOnlineServers[1].ip)}
+                title="Automatically configure Primary and Secondary DNS using the top 2 ranked servers"
+              >
+                ⚡ Auto-Apply Top 2 ({topOnlineServers[0].ip}, {topOnlineServers[1].ip})
+              </Button>
+            )}
+            {benchmarkStatus?.running ? (
+              <Button
+                danger
+                icon={<StopOutlined />}
+                onClick={handleStopBenchmark}
+              >
+                Stop Scan
+              </Button>
+            ) : (
+              <Button
+                type="primary"
+                icon={<PlayCircleOutlined />}
+                loading={benchmarkLoading}
+                onClick={handleStartBenchmark}
+                className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700"
+              >
+                {benchmarkStatus?.results?.length ? 'Re-scan DNS Servers' : 'Start DNS Benchmark'}
+              </Button>
+            )}
+          </Space>
+        }
+      >
+        <p className="text-secondary text-sm mb-4">
+          Benchmarks domestic and international DNS servers by probing <strong>google.com</strong> and all 6 domestic <strong>Bale Meet Gateways</strong> (<code>meet-gwbm1.ble.ir</code> to <code>meet-gwbm6.ble.ir</code>). The ranking algorithm heavily penalizes packet loss and gateway latency spikes to guarantee ultra-responsive Bale WebRTC tunneling.
+        </p>
+
+        {benchmarkStatus?.running && (
+          <div className="mb-6 p-4 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700">
+            <div className="flex justify-between items-center mb-2 text-sm">
+              <span className="font-semibold text-slate-700 dark:text-slate-300">
+                Scanning DNS servers... [{benchmarkStatus.completed} / {benchmarkStatus.total}]
+              </span>
+              <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                {benchmarkStatus.online_count} online servers found
+              </span>
+            </div>
+            <Progress
+              percent={benchmarkStatus.percent}
+              status="active"
+              strokeColor={{ from: '#3b82f6', to: '#6366f1' }}
+            />
+          </div>
+        )}
+
+        {/* Filters and Controls */}
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <Input
+            prefix={<SearchOutlined className="text-slate-400" />}
+            placeholder="Search by DNS IP..."
+            value={dnsSearch}
+            onChange={(e) => setDnsSearch(e.target.value)}
+            className="w-64"
+            allowClear
+          />
+          <div className="flex items-center gap-4 text-sm text-slate-500">
+            <div className="flex items-center gap-2">
+              <span>Show online only:</span>
+              <Switch checked={onlineOnly} onChange={setOnlineOnly} size="small" />
+            </div>
+            <span>
+              Total Tested: <strong>{benchmarkStatus?.results?.length || 0}</strong>
+              {benchmarkStatus?.online_count !== undefined && (
+                <> (<strong>{benchmarkStatus.online_count}</strong> active)</>
+              )}
+            </span>
+          </div>
+        </div>
+
+        {/* Results Table */}
+        <Table
+          dataSource={filteredResults}
+          columns={dnsColumns}
+          rowKey="ip"
+          size="middle"
+          pagination={{ pageSize: 15, showSizeChanger: true, pageSizeOptions: ['15', '30', '50', '100'] }}
+          className="overflow-x-auto"
+        />
       </Card>
 
       {/* Server URLs */}

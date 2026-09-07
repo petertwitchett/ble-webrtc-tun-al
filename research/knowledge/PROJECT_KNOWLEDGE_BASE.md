@@ -409,5 +409,23 @@ Whenever a change is introduced to this repository:
 | 2026-09-07 | Antigravity AI | `internal/api/`, `cmd/server/`, `cmd/client/` | Fixed QUIC handshake failure (XChaCha20 obfuscation mismatch) and Call Disconnect / Teardown deadlock: added `obfuscation_secret` sync via snapshot and settings APIs, resolved dynamic obfuscation on both client and server; fixed `runSessionLoopDB` to dynamically detect caller ID and immediately ACK/terminate calls upon `BLETUN:ENDCALL`; added listener unblocking on session context cancellation in `handleSFUProxy`; wired `apiSrv.OnForceEndCall` to force terminate all active router sessions and reset DB statuses; updated client `tm.Stop()` to automatically send `BLETUN:ENDCALL` on disconnect. |
 | 2026-09-07 | Antigravity AI | `cmd/client/main.go` | Implemented Fast Online Connection Policy & Dynamic Artery Scaling: activated SOCKS5 (:10909), HTTP (:9095) proxies, and Artery Orchestrator immediately upon first account pair connection (`proxyOnce.Do` / `orchOnce.Do`). Enabled real-time telemetry streaming and dynamic zero-downtime routing loop expansion across subsequent connecting arteries via P2C+WRR while preserving sequential rate-limit safe dialing. |
 | 2026-09-07 | Antigravity AI | `web/src/`, `internal/api/`, `cmd/client/` | Unified Disconnect & Server Call Termination: merged `Stop()` and `ForceEndCall()` into `StopAndEndCalls()` returning per-account termination results via `/api/tunnel/stop`. Synchronized Dashboard UI so clicking DISCONNECT immediately activates the ENDING status animation on the END CALLS button. Kept END CALLS button visible as a live status indicator (ENDED ✓ or RETRY END CALLS on failure) with click-to-retry enabled if any server accounts fail to disconnect. |
+| 2026-09-07 | Antigravity AI | `internal/dns/`, `internal/api/`, `web/src/` | Implemented high-performance concurrent DNS Speed Benchmark & Auto-Optimizer: ported Python DNS benchmark to native Go (`internal/dns/benchmark.go`), testing 42 curated DNS servers across Google and Bale SFU gateways (`meet-gwbm[1..6].ble.ir`). Added `/api/dns/benchmark/start`, `/api/dns/benchmark/status`, `/api/dns/benchmark/stop` REST endpoints, live benchmark scanner UI on SettingsPage with per-gateway latency breakdown, and 1-click Primary/Secondary DNS installation. Set default UI theme to light mode in `ThemeContext.tsx`. |
+| 2026-09-07 | Antigravity AI | Production Deployment (`192.168.2.150`) | Deployed updated project to local Proxmox container (`192.168.2.150` / `webrtc-proxy`): backed up existing deployment and SQLite database to `/root/vpn/ble-webrtc-tun.backup-20260907`, synchronized latest code and pre-compiled assets via rsync, compiled native Linux x86_64 binaries (`bin/client`, `bin/server`), verified `my-client.service` on boot, and validated live operation on port `:6681`. |
+
+---
+
+## 8. Remote Deployment Specification (Proxmox Container)
+
+- **Target Container:** `192.168.2.150` (`webrtc-proxy`, Linux x86_64)
+- **Deployment Path:** `/root/vpn/ble-webrtc-tun`
+- **Backup Path:** `/root/vpn/ble-webrtc-tun.backup-20260907` (full snapshot of previous code, database, and logs)
+- **Systemd Unit:** `/etc/systemd/system/my-client.service` (enabled on boot)
+  - `WorkingDirectory=/root/vpn/ble-webrtc-tun`
+  - `ExecStart=/root/vpn/ble-webrtc-tun/bin/client`
+  - `Restart=always`, `RestartSec=5`
+- **Active Admin Panel:** `http://192.168.2.150:6681` (protected with Basic Auth)
+- **Preserved State:** `data/client.db` (containing all user accounts, active pairings, and server sync credentials)
+- **Build Tool:** `/usr/local/go/bin/go` (Go 1.26.3 linux/amd64)
+
 
 

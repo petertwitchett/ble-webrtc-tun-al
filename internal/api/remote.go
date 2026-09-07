@@ -606,6 +606,94 @@ func (s *Server) handleRemoteSyncFromServer(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// handleRemoteRoutingSettings proxies GET/POST /api/routing/settings to the remote server.
+func (s *Server) handleRemoteRoutingSettings(w http.ResponseWriter, r *http.Request) {
+	if s.RemoteServerURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "remote server URL not configured")
+		return
+	}
+	resp, err := s.proxyToRemote(r.Method, "/api/routing/settings", r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("remote server error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// handleRemoteDNSBenchmarkStart proxies POST /api/dns/benchmark/start to the remote server.
+func (s *Server) handleRemoteDNSBenchmarkStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.RemoteServerURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "remote server URL not configured")
+		return
+	}
+	resp, err := s.proxyToRemote("POST", "/api/dns/benchmark/start", r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("remote server error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// handleRemoteDNSBenchmarkStatus proxies GET /api/dns/benchmark/status to the remote server.
+func (s *Server) handleRemoteDNSBenchmarkStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.RemoteServerURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "remote server URL not configured")
+		return
+	}
+	resp, err := s.proxyToRemote("GET", "/api/dns/benchmark/status", nil)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("remote server error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// handleRemoteDNSBenchmarkStop proxies POST /api/dns/benchmark/stop to the remote server.
+func (s *Server) handleRemoteDNSBenchmarkStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.RemoteServerURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "remote server URL not configured")
+		return
+	}
+	resp, err := s.proxyToRemote("POST", "/api/dns/benchmark/stop", nil)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("remote server error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
 // proxyToRemote makes an authenticated HTTP request to the remote server.
 func (s *Server) proxyToRemote(method, path string, body io.Reader) (*http.Response, error) {
 	url := s.RemoteServerURL + path

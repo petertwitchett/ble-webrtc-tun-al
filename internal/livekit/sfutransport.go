@@ -254,6 +254,9 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 	// RTCPFeedback:nil strips congestion control, SDPFmtpLine mimics real Opus.
 
 	se := webrtc.SettingEngine{}
+	if n := getAppNet(); n != nil {
+		se.SetNet(n)
+	}
 	se.SetICETimeouts(5*time.Second, 25*time.Second, 2*time.Second)
 	se.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024)
 	se.SetNetworkTypes([]webrtc.NetworkType{
@@ -340,6 +343,9 @@ func (s *SFUTransport) createSubscriber(iceServers []webrtc.ICEServer) error {
 	}
 
 	se := webrtc.SettingEngine{}
+	if n := getAppNet(); n != nil {
+		se.SetNet(n)
+	}
 	se.SetICETimeouts(5*time.Second, 25*time.Second, 2*time.Second)
 	se.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024)
 	se.SetNetworkTypes([]webrtc.NetworkType{
@@ -862,14 +868,15 @@ func (s *SFUTransport) readJoinResponse() (*lkproto.JoinResponse, []webrtc.ICESe
 
 	var servers []webrtc.ICEServer
 	for _, ice := range join.GetIceServers() {
-		srv := webrtc.ICEServer{URLs: ice.GetUrls()}
+		resolvedURLs := ResolveICEURLs(ice.GetUrls())
+		srv := webrtc.ICEServer{URLs: resolvedURLs}
 		if ice.GetUsername() != "" {
 			srv.Username = ice.GetUsername()
 			srv.Credential = ice.GetCredential()
 			srv.CredentialType = webrtc.ICECredentialTypePassword
 		}
 		servers = append(servers, srv)
-		sfuLog.Info("ICE: urls=%v user=%s", ice.GetUrls(), ice.GetUsername())
+		sfuLog.Info("ICE: urls=%v user=%s", resolvedURLs, ice.GetUsername())
 	}
 
 	return join, servers, nil

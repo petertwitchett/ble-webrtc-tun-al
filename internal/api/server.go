@@ -194,6 +194,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/remote/db/reset", s.handleRemoteDBReset)
 	s.mux.HandleFunc("/api/remote/pull-accounts", s.handleRemotePullAccounts)
 	s.mux.HandleFunc("/api/remote/sync-from-server", s.handleRemoteSyncFromServer)
+	s.mux.HandleFunc("/api/remote/routing/settings", s.handleRemoteRoutingSettings)
+	s.mux.HandleFunc("/api/remote/dns/benchmark/start", s.handleRemoteDNSBenchmarkStart)
+	s.mux.HandleFunc("/api/remote/dns/benchmark/status", s.handleRemoteDNSBenchmarkStatus)
+	s.mux.HandleFunc("/api/remote/dns/benchmark/stop", s.handleRemoteDNSBenchmarkStop)
 
 	// Tunnel controls
 	s.mux.HandleFunc("/api/tunnel/start", s.handleTunnelStart)

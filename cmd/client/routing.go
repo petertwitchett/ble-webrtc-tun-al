@@ -109,6 +109,8 @@ func (re *RoutingEngine) InstallAppDNS() {
 	if resolver == nil {
 		bale.SetAppDialContext(nil)
 		lk.SetAppDialContext(nil)
+		lk.SetAppLookupIP(nil)
+		lk.SetAppNet(nil)
 		return
 	}
 	// The method value resolver.DialContext has an unnamed function type that
@@ -116,6 +118,11 @@ func (re *RoutingEngine) InstallAppDNS() {
 	// packages, ensuring all Bale connections resolve through the app DNS.
 	bale.SetAppDialContext(resolver.DialContext)
 	lk.SetAppDialContext(resolver.DialContext)
+	lk.SetAppLookupIP(resolver.LookupIP)
+	pionNet, err := lk.NewPionNet(resolver.LookupIP, resolver.DialContext)
+	if err == nil {
+		lk.SetAppNet(pionNet)
+	}
 	primary, secondary := resolver.Servers()
 	routingLog.Info("Application DNS installed: %s / %s", primary, secondary)
 }

@@ -9,7 +9,7 @@ import {
   UploadOutlined, DatabaseOutlined, ExclamationCircleOutlined, LinkOutlined,
   GlobalOutlined, SafetyCertificateOutlined, ApiOutlined,
   PlayCircleOutlined, StopOutlined, DashboardOutlined,
-  RocketOutlined, SearchOutlined
+  RocketOutlined, SearchOutlined, UndoOutlined
 } from '@ant-design/icons';
 import { useTheme, THEMES, MODES } from '../../ThemeContext';
 import { api } from '../../api';
@@ -190,6 +190,29 @@ export function SettingsPage() {
       message.success(`Applied DNS: Primary=${primary} | Secondary=${secondary} — active traffic routing updated`);
     } catch (e: any) {
       message.error(e.message || 'Failed to apply DNS');
+    }
+  };
+
+  const handleResetDNS = async () => {
+    setRoutingSaving(true);
+    try {
+      const resetRouting = {
+        dns_primary: '',
+        dns_secondary: '',
+        bypass_domains: panelRole === 'SERVER' ? '' : routing.bypass_domains,
+      };
+      await api.updateRoutingSettings(resetRouting);
+      setRouting(resetRouting);
+      message.success(
+        panelRole === 'SERVER'
+          ? 'Bale DNS reset to Native Host DNS — now resolving via Clever Cloud OS resolver'
+          : 'DNS settings reset to default host resolver'
+      );
+      await loadRoutingSettings();
+    } catch (e: any) {
+      message.error(e.message || 'Failed to reset DNS');
+    } finally {
+      setRoutingSaving(false);
     }
   };
 
@@ -576,57 +599,124 @@ export function SettingsPage() {
         )}
       </Card>
 
-      {/* Application-Level DNS & Split-Tunneling */}
+      {/* Application-Level DNS / Bale Dedicated Split-DNS */}
       <Card
-        title={<><SafetyCertificateOutlined className="mr-2" />Application DNS &amp; Split-Tunneling</>}
+        title={
+          <div className="flex items-center gap-2">
+            {panelRole === 'SERVER' ? (
+              <>
+                <ApiOutlined className="text-blue-500" />
+                <span>Bale Dedicated Split-DNS (WebSocket &amp; WebRTC Acceleration)</span>
+                {routing.dns_primary || routing.dns_secondary ? (
+                  <Tag color="green">⚡ Split-DNS Active</Tag>
+                ) : (
+                  <Tag color="default">🌐 Native Clever Cloud DNS (Default)</Tag>
+                )}
+              </>
+            ) : (
+              <>
+                <SafetyCertificateOutlined className="mr-2" />
+                <span>Application DNS &amp; Split-Tunneling</span>
+                {routing.dns_primary || routing.dns_secondary ? (
+                  <Tag color="green">Active</Tag>
+                ) : (
+                  <Tag color="default">Default</Tag>
+                )}
+              </>
+            )}
+          </div>
+        }
         bordered={false}
         className="shadow-sm mb-6"
         extra={
-          <Button
-            type="primary"
-            icon={<SyncOutlined spin={routingSaving} />}
-            loading={routingSaving}
-            onClick={async () => {
-              setRoutingSaving(true);
-              try {
-                await api.updateRoutingSettings({
-                  dns_primary: routing.dns_primary.trim(),
-                  dns_secondary: routing.dns_secondary.trim(),
-                  bypass_domains: routing.bypass_domains.trim(),
-                });
-                message.success('Routing settings applied — new connections use updated DNS & bypass rules instantly');
-                await loadRoutingSettings();
-              } catch (e: any) {
-                message.error(e.message || 'Failed to save routing settings');
-              } finally {
-                setRoutingSaving(false);
-              }
-            }}
-          >
-            Apply
-          </Button>
+          <Space>
+            {(routing.dns_primary || routing.dns_secondary) && (
+              <Popconfirm
+                title={panelRole === 'SERVER' ? 'Reset Bale DNS to Native Clever Cloud DNS?' : 'Reset DNS to default?'}
+                description={
+                  panelRole === 'SERVER'
+                    ? 'Bale WebSocket and WebRTC connections will revert to resolving via Clever Cloud host OS resolver.'
+                    : 'Traffic will revert to resolving via host default resolver.'
+                }
+                onConfirm={handleResetDNS}
+                okText="Reset DNS"
+                cancelText="Cancel"
+              >
+                <Button icon={<UndoOutlined />} loading={routingSaving}>
+                  Reset to Native DNS
+                </Button>
+              </Popconfirm>
+            )}
+            <Button
+              type="primary"
+              icon={<SyncOutlined spin={routingSaving} />}
+              loading={routingSaving}
+              onClick={async () => {
+                setRoutingSaving(true);
+                try {
+                  await api.updateRoutingSettings({
+                    dns_primary: routing.dns_primary.trim(),
+                    dns_secondary: routing.dns_secondary.trim(),
+                    bypass_domains: panelRole === 'SERVER' ? '' : routing.bypass_domains.trim(),
+                  });
+                  message.success(
+                    panelRole === 'SERVER'
+                      ? 'Bale Split-DNS applied — Bale WebSocket & WebRTC connections updated'
+                      : 'Routing settings applied — new connections use updated DNS & bypass rules'
+                  );
+                  await loadRoutingSettings();
+                } catch (e: any) {
+                  message.error(e.message || 'Failed to save routing settings');
+                } finally {
+                  setRoutingSaving(false);
+                }
+              }}
+            >
+              Apply
+            </Button>
+          </Space>
         }
       >
-        <Alert
-          message="Application-Level DNS Resolution & Request Splitting"
-          description={
-            <div>
-              <p className="mb-1">All domain resolution and proxy traffic routing is performed through the DNS servers below, decoupled from the host OS resolver.</p>
-              <p className="mb-0">Iranian-domestic domains (servers hosted on Iranian IPs) and the custom bypass list below route <strong>directly over the local network</strong>, bypassing the WebRTC tunnel. Bale's own servers are never bypassed and always use the tunnel + custom DNS.</p>
-            </div>
-          }
-          type="info"
-          showIcon
-          icon={<ApiOutlined />}
-          className="mb-4"
-        />
+        {panelRole === 'SERVER' ? (
+          <Alert
+            message="Clever Cloud Split-DNS Isolation (Bale Only)"
+            description={
+              <div>
+                <p className="mb-1">
+                  Resolves domain names for <strong>Bale Signaling WebSocket</strong> (<code>web.bale.ir</code>), <strong>Bale WebRTC SFU Gateways</strong> (<code>meet-gwbm[1..6].ble.ir</code>), and <strong>STUN/TURN relays</strong> (<code>meet-turn.ble.ir</code>) exclusively through the high-speed DNS roots configured below.
+                </p>
+                <p className="mb-0 text-emerald-700 dark:text-emerald-400 font-medium">
+                  🛡️ All global internet proxy traffic forwarded by clients and internal Clever Cloud services (e.g. S3 Object Storage) strictly utilize the host's native DNS.
+                </p>
+              </div>
+            }
+            type="info"
+            showIcon
+            icon={<ApiOutlined />}
+            className="mb-4"
+          />
+        ) : (
+          <Alert
+            message="Application-Level DNS Resolution & Request Splitting"
+            description={
+              <div>
+                <p className="mb-1">All domain resolution and proxy traffic routing is performed through the DNS servers below, decoupled from the host OS resolver.</p>
+                <p className="mb-0">Iranian-domestic domains (servers hosted on Iranian IPs) and the custom bypass list below route <strong>directly over the local network</strong>, bypassing the WebRTC tunnel. Bale's own servers are never bypassed and always use the tunnel + custom DNS.</p>
+              </div>
+            }
+            type="info"
+            showIcon
+            icon={<ApiOutlined />}
+            className="mb-4"
+          />
+        )}
 
         <Row gutter={[24, 16]}>
           <Col xs={24} md={12}>
             <Text type="secondary" strong className="block mb-2 uppercase text-xs tracking-wider">Primary DNS Server</Text>
             <Input
               size="large"
-              placeholder="1.1.1.1"
+              placeholder={panelRole === 'SERVER' ? '185.161.112.33 (or run benchmark below)' : '1.1.1.1'}
               value={routing.dns_primary}
               onChange={(e) => setRouting({ ...routing, dns_primary: e.target.value })}
             />
@@ -635,25 +725,27 @@ export function SettingsPage() {
             <Text type="secondary" strong className="block mb-2 uppercase text-xs tracking-wider">Secondary DNS Server</Text>
             <Input
               size="large"
-              placeholder="1.0.0.1"
+              placeholder={panelRole === 'SERVER' ? '185.161.112.34 (or run benchmark below)' : '1.0.0.1'}
               value={routing.dns_secondary}
               onChange={(e) => setRouting({ ...routing, dns_secondary: e.target.value })}
             />
           </Col>
-          <Col xs={24}>
-            <Text type="secondary" strong className="block mb-2 uppercase text-xs tracking-wider">
-              Bypass Domains (comma-separated)
-            </Text>
-            <Input.TextArea
-              rows={3}
-              placeholder="example.com, bank.ir, my-site.ir"
-              value={routing.bypass_domains}
-              onChange={(e) => setRouting({ ...routing, bypass_domains: e.target.value })}
-            />
-            <Text type="secondary" className="block mt-2 text-xs">
-              Domains listed here (and their subdomains) bypass the tunnel and route directly over the local internet. Iranian-domestic IPs are detected automatically. Bale domains (<code>.bale.ai</code>, <code>.ble.ir</code>) are always tunneled.
-            </Text>
-          </Col>
+          {panelRole !== 'SERVER' && (
+            <Col xs={24}>
+              <Text type="secondary" strong className="block mb-2 uppercase text-xs tracking-wider">
+                Bypass Domains (comma-separated)
+              </Text>
+              <Input.TextArea
+                rows={3}
+                placeholder="example.com, bank.ir, my-site.ir"
+                value={routing.bypass_domains}
+                onChange={(e) => setRouting({ ...routing, bypass_domains: e.target.value })}
+              />
+              <Text type="secondary" className="block mt-2 text-xs">
+                Domains listed here (and their subdomains) bypass the tunnel and route directly over the local internet. Iranian-domestic IPs are detected automatically. Bale domains (<code>.bale.ai</code>, <code>.ble.ir</code>) are always tunneled.
+              </Text>
+            </Col>
+          )}
         </Row>
       </Card>
 

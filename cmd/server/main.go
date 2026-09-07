@@ -24,6 +24,7 @@ import (
 	"github.com/salman/ble-webrtc-tun/internal/config"
 	"github.com/salman/ble-webrtc-tun/internal/db"
 	"github.com/salman/ble-webrtc-tun/internal/dcconn"
+	"github.com/salman/ble-webrtc-tun/internal/dns"
 	"github.com/salman/ble-webrtc-tun/internal/livekit"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
 	"github.com/salman/ble-webrtc-tun/internal/quicconn"
@@ -129,6 +130,32 @@ func main() {
 		}()
 	}
 
+	// Initialize server-side Bale Dedicated Split-DNS resolver (for Bale WebSocket & WebRTC)
+	dnsPrimary, _ := serverDB.GetSetting("dns_primary")
+	dnsSecondary, _ := serverDB.GetSetting("dns_secondary")
+	serverResolver := dns.NewAppResolver(dnsPrimary, dnsSecondary)
+
+	installServerDNS := func() {
+		p, s := serverResolver.Servers()
+		if p == "" && s == "" {
+			bale.SetAppDialContext(nil)
+			livekit.SetAppDialContext(nil)
+			livekit.SetAppLookupIP(nil)
+			livekit.SetAppNet(nil)
+			mainLog.Info("🌐 Server Bale DNS: Using native host OS resolver (Clever Cloud default)")
+		} else {
+			bale.SetAppDialContext(serverResolver.DialContext)
+			livekit.SetAppDialContext(serverResolver.DialContext)
+			livekit.SetAppLookupIP(serverResolver.LookupIP)
+			pionNet, err := livekit.NewPionNet(serverResolver.LookupIP, serverResolver.DialContext)
+			if err == nil {
+				livekit.SetAppNet(pionNet)
+			}
+			mainLog.Info("⚡ Server Bale Dedicated Split-DNS ACTIVE: Primary=%s, Secondary=%s (Bale WS & WebRTC accelerated)", p, s)
+		}
+	}
+	installServerDNS()
+
 	// Load persisted Bale client-emulation constants from the database so they
 	// survive restarts, then refresh from the live Bale bundle.  Bale silently
 	// stops delivering push events (text messages, incoming calls) to clients
@@ -187,6 +214,33 @@ func main() {
 		return map[string]interface{}{
 			"ended_sessions": ended,
 			"status":         "all accounts reset to IDLE",
+		}, nil
+	}
+
+	// Wire routing settings callbacks for Bale Dedicated Split-DNS
+	apiSrv.OnReloadRouting = func(primary, secondary, bypassDomains string) error {
+		if err := serverDB.SetSetting("dns_primary", primary); err != nil {
+			return err
+		}
+		if err := serverDB.SetSetting("dns_secondary", secondary); err != nil {
+			return err
+		}
+		serverResolver.SetServers(primary, secondary)
+		installServerDNS()
+		if primary == "" && secondary == "" {
+			adminPanel.AddLog("info", "Bale DNS: Reset to native host OS resolver")
+		} else {
+			adminPanel.AddLog("info", fmt.Sprintf("Bale Dedicated Split-DNS updated: %s / %s", primary, secondary))
+		}
+		return nil
+	}
+
+	apiSrv.GetRoutingSettings = func() (map[string]string, error) {
+		p, s := serverResolver.Servers()
+		return map[string]string{
+			"dns_primary":    p,
+			"dns_secondary":  s,
+			"bypass_domains": "",
 		}, nil
 	}
 

@@ -105,13 +105,22 @@ func NewAppResolver(primary, secondary string) *AppResolver {
 	return r
 }
 
+// ClearCache flushes all cached positive and negative DNS entries so newly
+// configured servers take effect immediately without waiting for TTL expiry.
+func (r *AppResolver) ClearCache() {
+	r.cacheMu.Lock()
+	r.cache = make(map[string]*cacheEntry)
+	r.cacheMu.Unlock()
+}
+
 // SetServers atomically replaces the primary and secondary upstream DNS
-// targets. Safe to call concurrently with LookupIP / DialContext.
+// targets and flushes the cache. Safe to call concurrently with LookupIP / DialContext.
 func (r *AppResolver) SetServers(primary, secondary string) {
 	r.servers.Store(&resolverServers{
 		primary:   primary,
 		secondary: secondary,
 	})
+	r.ClearCache()
 }
 
 // Servers returns the currently configured primary and secondary DNS targets.

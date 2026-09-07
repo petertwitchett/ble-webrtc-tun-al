@@ -860,8 +860,36 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 	var channels []*channelState
 	var mu sync.Mutex
 	var proxyOnce sync.Once
+	var orchOnce sync.Once
 
-	// === SEQUENTIAL CONNECTION — MULTI-QUIC MODE ===
+	// Background health monitor + stats: runs continuously as channels join
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				for _, ch := range channels {
+					stats := ch.sfu.GetStats()
+					var sent, recv int64
+					if s, ok := stats["bytes_sent"].(int64); ok {
+						sent = s
+					}
+					if r, ok := stats["bytes_received"].(int64); ok {
+						recv = r
+					}
+					tm.updateChannelStats(ch.index-1, sent, recv)
+					tm.updateChannelHealth(ch.index-1, ch.sfu)
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	// === SEQUENTIAL CONNECTION WITH INSTANT FIRST-ACCOUNT PROXY ACTIVATION ===
 	// Connect channels sequentially. Each channel fully establishes WebRTC
 	// signaling and dials its own independent QUIC connection before the next
 	// one starts. This avoids concurrent ICE/DTLS negotiations that trigger
@@ -896,6 +924,33 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		mu.Unlock()
 
 		go tm.monitorAndReconnect(ctx, tunnelPool, ch, qconn, i, pair, label, &mu, &channels, &proxyOnce)
+
+		// ── FAST ACTIVATION POLICY: START PROXIES ON FIRST CONNECTION ──
+		// As soon as the FIRST connection succeeds, bring SOCKS5 & HTTP online immediately.
+		// Internet traffic starts flowing right away over the live artery.
+		// Subsequent channels will dynamically join the pool and receive traffic via P2C+WRR.
+		proxyOnce.Do(func() {
+			go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool, tm.routing)
+			go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool, tm.routing)
+			mainLog.Info(" 🚀 FAST ONLINE: SOCKS5 (:10909) and HTTP (:9095) proxies are now LIVE on first connection!")
+			for _, ip := range getLocalIPs() {
+				mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
+			}
+		})
+
+		// Start Artery Orchestrator as soon as the first connection is live
+		orchOnce.Do(func() {
+			orch := tm.startArteryOrchestrator(ctx, tunnelPool, &channels, &mu, pairs)
+			tm.mu.Lock()
+			tm.orchestrator = orch
+			tm.mu.Unlock()
+			mainLog.Info(" 🧠 Artery orchestrator active — autonomous health & load-balancing engaged")
+		})
+
+		if tunnelPool.ActiveCount() > 1 {
+			mainLog.Info(" ⚡ [Load Balancer] Added %s to pool — balancing traffic across %d/%d active arteries",
+				label, tunnelPool.ActiveCount(), len(pairs))
+		}
 	}
 
 	if ctx.Err() != nil {
@@ -911,30 +966,9 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		tm.Stop()
 		return
 	}
-	mainLog.Info(" 🟢 %d/%d channels active — READY (artery orchestrator starting)", active, len(pairs))
+	mainLog.Info(" 🟢 All %d pairs connected/evaluated — %d/%d channels active in pool", len(pairs), active, len(pairs))
 
-	// === Start the Artery Orchestrator ===
-	// The orchestrator runs three background loops:
-	// - Telemetry (500ms): EWMA RTT collection + loss tracking
-	// - Hysteresis (1s):   Demotion/promotion evaluation
-	// - Dead detection (3s): Connection liveness + autonomous revival
-	orch := tm.startArteryOrchestrator(ctx, tunnelPool, &channels, &mu, pairs)
-	tm.mu.Lock()
-	tm.orchestrator = orch
-	tm.mu.Unlock()
-	mainLog.Info(" 🧠 Artery orchestrator active — autonomous health management engaged")
-
-	// Start SOCKS5 / HTTP proxies once at least one QUIC connection is live.
-	proxyOnce.Do(func() {
-		go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool, tm.routing)
-		go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool, tm.routing)
-		mainLog.Info(" ✅ Proxies started!")
-		for _, ip := range getLocalIPs() {
-			mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
-		}
-	})
-
-	// Health monitor + stats (lightweight sampling, doesn't affect VPN throughput)
+	// Liveness monitor: wait until ctx cancelled or all channels die
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -975,21 +1009,6 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 				tm.Stop()
 				return
 			}
-			// Update per-channel stats and health (lightweight — just read counters)
-			mu.Lock()
-			for _, ch := range channels {
-				stats := ch.sfu.GetStats()
-				var sent, recv int64
-				if s, ok := stats["bytes_sent"].(int64); ok {
-					sent = s
-				}
-				if r, ok := stats["bytes_received"].(int64); ok {
-					recv = r
-				}
-				tm.updateChannelStats(ch.index-1, sent, recv)
-				tm.updateChannelHealth(ch.index-1, ch.sfu)
-			}
-			mu.Unlock()
 		}
 	}
 }

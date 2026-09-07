@@ -36,7 +36,7 @@ type Server struct {
 
 	// Tunnel callbacks (used by client role)
 	OnTunnelStart   func() error
-	OnTunnelStop    func() error
+	OnTunnelStop    func() (map[string]interface{}, error)
 	GetTunnelStatus func() (interface{}, error)
 	GetClientID     func() string
 	OnForceEndCall  func() (map[string]interface{}, error)
@@ -244,8 +244,13 @@ func (s *Server) handleTunnelStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.OnTunnelStop != nil {
-		if err := s.OnTunnelStop(); err != nil {
+		res, err := s.OnTunnelStop()
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if res != nil {
+			writeJSON(w, http.StatusOK, res)
 			return
 		}
 		writeOK(w, "Tunnel stopped")

@@ -150,9 +150,8 @@ func main() {
 	apiSrv.OnTunnelStart = func() error {
 		return tm.Start()
 	}
-	apiSrv.OnTunnelStop = func() error {
-		tm.Stop()
-		return nil
+	apiSrv.OnTunnelStop = func() (map[string]interface{}, error) {
+		return tm.StopAndEndCalls()
 	}
 	apiSrv.GetTunnelStatus = func() (interface{}, error) {
 		return tm.GetDetailedStatus(), nil
@@ -603,10 +602,17 @@ func (tm *TunnelManager) Stop() {
 		}
 	}
 	tm.channelMu.Unlock()
-	mainLog.Info("[Manager] Tunnel stopped. Sending clean hangup to servers...")
-	go func() {
-		_, _ = tm.ForceEndCall()
-	}()
+	mainLog.Info("[Manager] Tunnel stopped.")
+}
+
+// StopAndEndCalls unifies disconnecting the local tunnel and ending all calls on the server.
+// It stops local proxy and routing, closes channel sessions, and invokes ForceEndCall()
+// which sends BLETUN:ENDCALL to all paired server accounts and waits for explicit ACKs.
+func (tm *TunnelManager) StopAndEndCalls() (map[string]interface{}, error) {
+	mainLog.Info("[Manager] Disconnecting tunnel and ending all calls on server...")
+	tm.Stop()
+	time.Sleep(600 * time.Millisecond)
+	return tm.ForceEndCall()
 }
 
 // ForceEndCall sends BLETUN:ENDCALL to all paired server accounts via Bale,

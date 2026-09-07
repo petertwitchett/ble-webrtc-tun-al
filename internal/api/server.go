@@ -126,9 +126,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/stats", s.handleStats)
 	s.mux.HandleFunc("/api/health", s.handleHealth)
 
-	// Backup & Restore (full DB export/import)
+	// Backup, Restore & Reset (full DB export/import/reset)
 	s.mux.HandleFunc("/api/db/backup", s.handleBackup)
 	s.mux.HandleFunc("/api/db/restore", s.handleRestore)
+	s.mux.HandleFunc("/api/db/reset", s.handleDBReset)
 
 	// Events (for sync)
 	s.mux.HandleFunc("/api/events", s.handleEvents)
@@ -190,6 +191,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/remote/pairings/", s.handleRemotePushSinglePairing) // /api/remote/pairings/{id}/push
 	s.mux.HandleFunc("/api/remote/db/backup", s.handleRemoteDBBackup)
 	s.mux.HandleFunc("/api/remote/db/restore", s.handleRemoteDBRestore)
+	s.mux.HandleFunc("/api/remote/db/reset", s.handleRemoteDBReset)
 	s.mux.HandleFunc("/api/remote/pull-accounts", s.handleRemotePullAccounts)
 	s.mux.HandleFunc("/api/remote/sync-from-server", s.handleRemoteSyncFromServer)
 

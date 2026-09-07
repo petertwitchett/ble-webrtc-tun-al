@@ -89,6 +89,36 @@ export function SettingsPage() {
     }
   };
 
+  const [resetting, setResetting] = useState(false);
+  const [remoteResetting, setRemoteResetting] = useState(false);
+
+  const handleResetDatabase = async () => {
+    setResetting(true);
+    try {
+      const res = await api.dbReset();
+      message.success(res?.message || 'Database reset successfully: accounts, pairings, and logs cleared.');
+      loadSyncStatus();
+      loadS3Status();
+    } catch (e: any) {
+      message.error(e.message || 'Database reset failed');
+    } finally {
+      setResetting(false);
+    }
+  };
+
+  const handleResetRemoteDatabase = async () => {
+    setRemoteResetting(true);
+    try {
+      const res = await api.remoteDBReset();
+      message.success(res?.message || 'Remote server database reset successfully.');
+      loadSyncStatus();
+    } catch (e: any) {
+      message.error(e.message || 'Remote database reset failed');
+    } finally {
+      setRemoteResetting(false);
+    }
+  };
+
   // DNS Speed Benchmark state
   const [benchmarkStatus, setBenchmarkStatus] = useState<any>(null);
   const [benchmarkLoading, setBenchmarkLoading] = useState(false);
@@ -1093,6 +1123,55 @@ export function SettingsPage() {
             </Card>
           </Col>
         </Row>
+
+        <Divider className="my-6" />
+
+        <div className="bg-red-500/5 dark:bg-red-500/10 border border-red-200 dark:border-red-900/40 rounded-xl p-4">
+          <Row gutter={[16, 16]} align="middle" justify="space-between">
+            <Col xs={24} lg={15}>
+              <Space direction="vertical" size={2}>
+                <Text strong className="text-red-600 dark:text-red-400 text-base">
+                  <ExclamationCircleOutlined className="mr-1.5" />
+                  Reset Database (Factory Clean)
+                </Text>
+                <Text type="secondary" className="text-xs block">
+                  Permanently clears all accounts, pairings, connection logs, and sync events from the database.
+                  <strong> Settings (Bale parameters, DNS, Appearance) and Admin logins are safely preserved.</strong>
+                </Text>
+              </Space>
+            </Col>
+            <Col xs={24} lg={9} className="text-right">
+              <Space wrap>
+                {panelRole === 'CLIENT' && remoteServerURL && (
+                  <Popconfirm
+                    title="Reset Remote Server Database?"
+                    description="This will clear all accounts, pairings, and logs on the Clever Cloud server. Settings and admin credentials will be preserved."
+                    onConfirm={handleResetRemoteDatabase}
+                    okText="Yes, Reset Server DB"
+                    cancelText="Cancel"
+                    okButtonProps={{ danger: true }}
+                  >
+                    <Button danger loading={remoteResetting}>
+                      Reset Server DB
+                    </Button>
+                  </Popconfirm>
+                )}
+                <Popconfirm
+                  title="Reset Database?"
+                  description="Permanently clear all accounts, pairings, and logs? Settings and admin logins will be preserved."
+                  onConfirm={handleResetDatabase}
+                  okText="Yes, Reset Everything"
+                  cancelText="Cancel"
+                  okButtonProps={{ danger: true }}
+                >
+                  <Button type="primary" danger loading={resetting}>
+                    Reset {panelRole === 'SERVER' ? 'Server' : 'Local'} Database
+                  </Button>
+                </Popconfirm>
+              </Space>
+            </Col>
+          </Row>
+        </div>
       </Card>
 
       <Card title="Theme Preview" bordered={false} className="shadow-sm">

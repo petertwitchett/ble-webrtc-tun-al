@@ -149,6 +149,67 @@ func (d *Database) CheckpointWAL() error {
 	return d.DB.Exec("PRAGMA wal_checkpoint(FULL)").Error
 }
 
+// ResetStats holds the count of records purged during a database reset.
+type ResetStats struct {
+	AccountsDeleted int64 `json:"accounts_deleted"`
+	PairingsDeleted int64 `json:"pairings_deleted"`
+	LogsDeleted     int64 `json:"logs_deleted"`
+	EventsDeleted   int64 `json:"events_deleted"`
+}
+
+// ResetData completely purges accounts, pairings, connection logs, and sync events,
+// while strictly preserving settings and admin users.
+func (d *Database) ResetData() (*ResetStats, error) {
+	stats := &ResetStats{}
+
+	err := d.DB.Transaction(func(tx *gorm.DB) error {
+		_ = tx.Exec("PRAGMA foreign_keys = OFF")
+		defer tx.Exec("PRAGMA foreign_keys = ON")
+
+		// 1. Delete connection logs first (references Accounts and Pairings)
+		resL := tx.Unscoped().Where("1 = 1").Delete(&ConnectionLog{})
+		if resL.Error != nil {
+			return resL.Error
+		}
+		stats.LogsDeleted = resL.RowsAffected
+
+		// 2. Delete pairings (references Accounts)
+		resP := tx.Unscoped().Where("1 = 1").Delete(&Pairing{})
+		if resP.Error != nil {
+			return resP.Error
+		}
+		stats.PairingsDeleted = resP.RowsAffected
+
+		// 3. Delete sync events
+		resE := tx.Unscoped().Where("1 = 1").Delete(&Event{})
+		if resE.Error != nil {
+			return resE.Error
+		}
+		stats.EventsDeleted = resE.RowsAffected
+
+		// 4. Delete accounts
+		resA := tx.Unscoped().Where("1 = 1").Delete(&Account{})
+		if resA.Error != nil {
+			return resA.Error
+		}
+		stats.AccountsDeleted = resA.RowsAffected
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	d.triggerMutation()
+	_ = d.CheckpointWAL()
+
+	dbLog.Info("🗑️ Database reset completed: %d accounts, %d pairings, %d logs, %d events deleted (settings & admin preserved)",
+		stats.AccountsDeleted, stats.PairingsDeleted, stats.LogsDeleted, stats.EventsDeleted)
+
+	return stats, nil
+}
+
 // Role returns the database role (client or server).
 func (d *Database) Role() string {
 	return d.role
@@ -167,4 +228,5 @@ func (d *Database) Close() error {
 	}
 	return sqlDB.Close()
 }
+
 

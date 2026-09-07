@@ -72,6 +72,7 @@ export const api = {
   remotePullAccounts: () => request('/remote/pull-accounts', { method: 'POST' }),
   remoteDBBackup: () => request('/remote/db/backup'),
   remoteDBRestore: (data: any) => request('/remote/db/restore', { method: 'POST', body: JSON.stringify(data) }),
+  remoteDBReset: () => request('/remote/db/reset', { method: 'POST' }),
   remoteSyncFromServer: () => request('/remote/sync-from-server', { method: 'POST' }),
 
   listPairings: (ownerID?: string) => request('/pairings' + (ownerID ? `?owner_id=${ownerID}` : '')),
@@ -130,6 +131,7 @@ export const api = {
   // Backup & Restore
   dbBackup: () => request('/db/backup'),
   dbRestore: (data: any) => request('/db/restore', { method: 'POST', body: JSON.stringify(data) }),
+  dbReset: () => request('/db/reset', { method: 'POST' }),
 
   // S3 Cloud Persistence (Clever Cloud Cellar S3)
   getS3Status: () => request('/s3/status'),

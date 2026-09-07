@@ -341,6 +341,30 @@ func (s *Server) handleRemoteDBRestore(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
+// handleRemoteDBReset proxies POST /api/db/reset to the remote server.
+func (s *Server) handleRemoteDBReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.RemoteServerURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "remote server URL not configured")
+		return
+	}
+
+	resp, err := s.proxyToRemote("POST", "/api/db/reset", r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("remote server error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
 // handleRemotePullAccounts pulls SERVER accounts from the remote server
 // and inserts them locally if they don't already exist.
 // POST /api/remote/pull-accounts

@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/salman/ble-webrtc-tun/internal/db"
@@ -276,3 +278,57 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		"backup_created_at": backup.CreatedAt,
 	})
 }
+
+// handleDBReset handles POST /api/db/reset.
+// Completely purges accounts, pairings, connection logs, and sync events,
+// while preserving settings and admin users.
+func (s *Server) handleDBReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	// 1. Terminate any active calls / sessions
+	if s.OnForceEndCall != nil {
+		_, _ = s.OnForceEndCall()
+	}
+	if s.router != nil {
+		sessions := s.router.GetAllSessions()
+		for _, sess := range sessions {
+			s.router.ForceEndCall(sess.ServerAccountID)
+		}
+	}
+
+	// 2. Backup/rename .env.tokens if present to avoid resurrection upon reboot
+	if _, err := os.Stat(".env.tokens"); err == nil {
+		_ = os.Rename(".env.tokens", fmt.Sprintf(".env.tokens.bak-%d", time.Now().Unix()))
+	}
+
+	// 3. Reset database records
+	stats, err := s.database.ResetData()
+	if err != nil {
+		apiLog.Error("Failed to reset database: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to reset database: "+err.Error())
+		return
+	}
+
+	bumpDataVersion()
+
+	// 4. If S3 syncer is active (server), sync the reset state to S3
+	if s.S3Syncer != nil {
+		go func() {
+			_ = s.S3Syncer.SyncNow(context.Background())
+		}()
+	}
+
+	apiLog.Info("🗑️ Database reset: %d accounts, %d pairings, %d logs deleted",
+		stats.AccountsDeleted, stats.PairingsDeleted, stats.LogsDeleted)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("Reset complete: %d accounts, %d pairings, and %d logs deleted. Settings and admin credentials were preserved.",
+			stats.AccountsDeleted, stats.PairingsDeleted, stats.LogsDeleted),
+		"stats": stats,
+	})
+}
+

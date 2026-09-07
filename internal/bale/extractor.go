@@ -105,9 +105,11 @@ var reChromeVersion = regexp.MustCompile(`Chrome/(\d+)`)
 var reChromiumSecCHUA = regexp.MustCompile(`Chromium";v="(\d+)"`)
 
 // Infrastructure URLs.
-var reBaleWSURL = regexp.MustCompile(`(wss?://[a-zA-Z0-9.-]+\.bale\.ai[a-zA-Z0-9./_:-]*)`)
-var reBaleHTTPURL = regexp.MustCompile(`(https?://[a-zA-Z0-9.-]+\.bale\.ai[a-zA-Z0-9./_:-]*)`)
-var reBleIrURL = regexp.MustCompile(`(https?://[a-zA-Z0-9.-]+\.ble\.ir[a-zA-Z0-9./_:-]*)`)
+var reBaleGRPC = regexp.MustCompile(`grpc:\s*["'](https://[a-zA-Z0-9.-]+\.bale\.ai)["']`)
+var reBaleWS = regexp.MustCompile(`ws:\s*["'](wss://[a-zA-Z0-9.-]+\.bale\.ai/ws/?)["']`)
+var reBaleWSURL = regexp.MustCompile(`(wss?://[a-zA-Z0-9.-]+-ws\.bale\.ai[a-zA-Z0-9./_:-]*)`)
+var reBaleHTTPURL = regexp.MustCompile(`(https?://[a-zA-Z0-9.-]+-ws\.bale\.ai[a-zA-Z0-9./_:-]*)`)
+var reBleIrURL = regexp.MustCompile(`(https?://web\.ble\.ir[a-zA-Z0-9./_:-]*|https?://meet-gw[a-zA-Z0-9.-]*\.ble\.ir)`)
 
 // scrapeClient builds an HTTP client that mimics a real Chrome browser and
 // resolves hosts through the admin-configured application DNS engine when
@@ -273,31 +275,38 @@ func extractBrowserVersion(content string) string {
 
 // extractInfraURLs searches content for Bale/ble infrastructure URLs.
 func extractInfraURLs(content string) (wsURL, grpcBase, livekitOrigin, baleWebOrigin string) {
-	if m := reBaleWSURL.FindStringSubmatch(content); len(m) >= 2 {
-		wsURL = strings.TrimRight(m[1], "/")
-		// Normalize: ensure it ends with /ws/ like the Bale signaling endpoint.
-		if strings.Contains(wsURL, "/ws") {
-			if !strings.HasSuffix(wsURL, "/ws/") {
-				if strings.HasSuffix(wsURL, "/ws") {
-					wsURL += "/"
-				}
-			}
-		} else {
-			wsURL = wsURL + "/ws/"
+	if m := reBaleWS.FindStringSubmatch(content); len(m) >= 2 {
+		wsURL = m[1]
+		if !strings.HasSuffix(wsURL, "/") {
+			wsURL += "/"
 		}
-	}
-	if m := reBaleHTTPURL.FindStringSubmatch(content); len(m) >= 2 {
+	} else if m := reBaleWSURL.FindStringSubmatch(content); len(m) >= 2 {
 		u := strings.TrimRight(m[1], "/")
-		// The gRPC-Web base is the https URL without a trailing path.
-		if strings.HasPrefix(u, "https://") {
+		if !strings.HasSuffix(u, "/ws/") {
+			if strings.HasSuffix(u, "/ws") {
+				u += "/"
+			} else {
+				u += "/ws/"
+			}
+		}
+		wsURL = u
+	}
+
+	if m := reBaleGRPC.FindStringSubmatch(content); len(m) >= 2 {
+		grpcBase = strings.TrimRight(m[1], "/")
+		baleWebOrigin = "https://web.bale.ai"
+	} else if m := reBaleHTTPURL.FindStringSubmatch(content); len(m) >= 2 {
+		u := strings.TrimRight(m[1], "/")
+		if !strings.Contains(u, "assets.") && !strings.Contains(u, ".json") {
 			grpcBase = u
 			baleWebOrigin = "https://web.bale.ai"
 		}
 	}
+
 	if m := reBleIrURL.FindStringSubmatch(content); len(m) >= 2 {
 		u := strings.TrimRight(m[1], "/")
-		if strings.HasPrefix(u, "https://") {
-			livekitOrigin = u
+		if !strings.Contains(u, "flags.") {
+			livekitOrigin = "https://web.ble.ir"
 		}
 	}
 	return

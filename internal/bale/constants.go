@@ -239,6 +239,9 @@ func SetBaleGRPCBase(v string) {
 	if v == "" {
 		return
 	}
+	if strings.Contains(v, "assets.") || strings.Contains(v, ".json") {
+		return
+	}
 	store.mu.Lock()
 	store.baleGRPCBase = v
 	store.mu.Unlock()
@@ -247,6 +250,9 @@ func SetBaleGRPCBase(v string) {
 // SetLiveKitOrigin updates the LiveKit Origin constant.
 func SetLiveKitOrigin(v string) {
 	if v == "" {
+		return
+	}
+	if strings.Contains(v, "flags.") {
 		return
 	}
 	store.mu.Lock()

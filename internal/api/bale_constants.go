@@ -11,22 +11,36 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"time"
 
 	"github.com/salman/ble-webrtc-tun/internal/bale"
 )
 
-// handleBaleConstants handles GET /api/bale/constants — returns the current
-// in-memory client-emulation constants (app_version, LiveKit SDK/protocol
-// versions, browser version, infrastructure URLs, last-sync timestamp).
+// handleBaleConstants handles GET, PUT, and POST /api/bale/constants —
+// returns or updates the current in-memory client-emulation constants
+// and persists any modifications to the database.
 func (s *Server) handleBaleConstants(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "GET only")
+	if r.Method == http.MethodGet {
+		snap := bale.Snapshot()
+		writeJSON(w, http.StatusOK, snap)
 		return
 	}
-	snap := bale.Snapshot()
-	writeJSON(w, http.StatusOK, snap)
+	if r.Method == http.MethodPut || r.Method == http.MethodPost {
+		var req bale.ConstantSnapshot
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
+		bale.ApplySnapshot(req)
+		if err := bale.PersistToSettings(s.database); err != nil {
+			apiLog.Warn("Failed to persist constants to settings: %v", err)
+		}
+		writeJSON(w, http.StatusOK, bale.Snapshot())
+		return
+	}
+	writeError(w, http.StatusMethodNotAllowed, "GET, PUT, or POST only")
 }
 
 // handleBaleConstantsSync handles POST /api/bale/constants/sync — triggers a

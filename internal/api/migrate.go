@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"strings"
+
+	"github.com/salman/ble-webrtc-tun/internal/bale"
 )
 
 // handleMigrate triggers migration from .env.tokens to database.
@@ -136,6 +139,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if err := s.database.SetSetting(req.Key, req.Value); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if strings.HasPrefix(req.Key, "bale.") {
+			bale.LoadFromSettings(s.database)
 		}
 		writeOK(w, "setting saved")
 

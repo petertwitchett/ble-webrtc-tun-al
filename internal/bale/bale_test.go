@@ -12,6 +12,37 @@ func TestClientConstants(t *testing.T) {
 	if BrowserVersion() != "151.0.0.0" {
 		t.Fatalf("expected browser_version 151.0.0.0, got %s", BrowserVersion())
 	}
+
+	// Test that invalid CDN asset URLs are rejected by SetBaleGRPCBase
+	origGRPC := BaleGRPCBase()
+	defer SetBaleGRPCBase(origGRPC)
+
+	SetBaleGRPCBase("https://assets.bale.ai/configs.json")
+	if BaleGRPCBase() == "https://assets.bale.ai/configs.json" {
+		t.Fatalf("expected assets URL to be rejected by SetBaleGRPCBase")
+	}
+
+	SetBaleGRPCBase("https://next-ws.bale.ai")
+	if BaleGRPCBase() != "https://next-ws.bale.ai" {
+		t.Fatalf("expected https://next-ws.bale.ai to be accepted")
+	}
+}
+
+func TestExtractInfraURLs(t *testing.T) {
+	sample := `var config = { ws: "wss://next-ws.bale.ai/ws/", grpc: "https://next-ws.bale.ai", url: "https://assets.bale.ai/configs.json", flag: "https://flags.ble.ir/api/frontend", meet: "https://web.ble.ir" };`
+	ws, grpc, lk, origin := extractInfraURLs(sample)
+	if ws != "wss://next-ws.bale.ai/ws/" {
+		t.Errorf("expected ws wss://next-ws.bale.ai/ws/, got %s", ws)
+	}
+	if grpc != "https://next-ws.bale.ai" {
+		t.Errorf("expected grpc https://next-ws.bale.ai, got %s", grpc)
+	}
+	if lk != "https://web.ble.ir" {
+		t.Errorf("expected livekit origin https://web.ble.ir, got %s", lk)
+	}
+	if origin != "https://web.bale.ai" {
+		t.Errorf("expected origin https://web.bale.ai, got %s", origin)
+	}
 }
 
 func TestBuildMetadata(t *testing.T) {

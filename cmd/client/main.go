@@ -1666,7 +1666,7 @@ func detectRemoteServerURL() string {
 	}
 
 	// 3. Hardcoded fallback for known Clever Cloud deployment
-	const fallbackURL = "https://app-7c1a120b-18c6-43fd-850c-b2883b209c3d.cleverapps.io"
+	const fallbackURL = "https://app-eb142ec2-97df-4403-bd0a-723fbbc767f9.cleverapps.io"
 	return fallbackURL
 }
 

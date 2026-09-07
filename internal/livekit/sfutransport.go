@@ -80,6 +80,8 @@ type SFUTransport struct {
 	pendingSubCandidates []webrtc.ICECandidateInit
 	pubRemoteSet         bool
 	subRemoteSet         bool
+
+	peerDisconnected atomic.Bool
 }
 
 // NewSFUTransport creates a transport that routes through the LiveKit SFU.
@@ -750,6 +752,14 @@ func (s *SFUTransport) handleSignalResponse(resp *lkproto.SignalResponse) {
 
 	case *lkproto.SignalResponse_Update:
 		sfuLog.Info("Participant update")
+		if msg.Update != nil {
+			for _, p := range msg.Update.GetParticipants() {
+				if p.GetState() == lkproto.ParticipantInfo_DISCONNECTED {
+					sfuLog.Warn("[SFU] Remote participant %s disconnected", p.GetIdentity())
+					s.peerDisconnected.Store(true)
+				}
+			}
+		}
 
 	case *lkproto.SignalResponse_TrackPublished:
 		cid := msg.TrackPublished.GetCid()
@@ -959,4 +969,9 @@ func (s *SFUTransport) bypassICEServerIPs(iceServers []webrtc.ICEServer) {
 			}
 		}
 	}
+}
+
+// IsPeerDisconnected returns true if the SFU reported the remote peer disconnected.
+func (s *SFUTransport) IsPeerDisconnected() bool {
+	return s.peerDisconnected.Load()
 }

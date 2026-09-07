@@ -68,6 +68,7 @@ var minimalOpusSilence = []byte{0xF8, 0xFF, 0xFE}
 type Conn struct {
 	localTrack     *webrtc.TrackLocalStaticSample // Single dedicated track
 	trackLastWrite atomic.Int64                    // Last write time (UnixNano)
+	lastInbound    atomic.Int64                    // Last inbound packet time (UnixNano)
 
 	readCh chan []byte
 	buf    []byte
@@ -96,7 +97,9 @@ func New(localTrack *webrtc.TrackLocalStaticSample, obfuscator *dcconn.Obfuscato
 		done:       make(chan struct{}),
 		obfuscator: obfuscator,
 	}
-	c.trackLastWrite.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	c.trackLastWrite.Store(now)
+	c.lastInbound.Store(now)
 	if obfuscator != nil && obfuscator.Enabled() {
 		rtpLog.Info("RTP obfuscation enabled (XChaCha20-Poly1305, overhead: %d bytes/pkt)", obfuscator.Overhead())
 	}
@@ -142,6 +145,9 @@ func (c *Conn) HandleRTP(payload []byte) {
 	if c.closed.Load() || len(payload) == 0 {
 		return
 	}
+	// Update inbound activity timestamp immediately (including silence keepalives)
+	c.lastInbound.Store(time.Now().UnixNano())
+
 	// Skip the 3-byte Opus DTX silence keepalive frame.
 	if isOpusSilence(payload) {
 		return
@@ -333,4 +339,13 @@ func (c *Conn) QueueDepth() int { return 0 }
 func isOpusSilence(payload []byte) bool {
 	return len(payload) == 3 &&
 		payload[0] == 0xF8 && payload[1] == 0xFF && payload[2] == 0xFE
+}
+
+// LastInboundTime returns the timestamp of the last received inbound packet (RTP or silence).
+func (c *Conn) LastInboundTime() time.Time {
+	nanos := c.lastInbound.Load()
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
 }

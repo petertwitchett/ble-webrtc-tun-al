@@ -283,9 +283,35 @@ func (r *Router) EndCallWithError(serverAccountID uint, bytesSent, bytesRecv int
 	routerLog.Error("Call ended with error: server=%d error=%s", serverAccountID, errMsg)
 }
 
+// PreemptSession terminates an active or stale session on a server account,
+// unblocking it so a reconnecting call from the paired client can proceed immediately.
+func (r *Router) PreemptSession(serverAccountID uint, reason string) {
+	r.mu.Lock()
+	session, exists := r.sessions[serverAccountID]
+	if exists {
+		delete(r.sessions, serverAccountID)
+	}
+	r.mu.Unlock()
+
+	if exists && session != nil {
+		if session.cancelFn != nil {
+			session.cancelFn()
+		}
+		if session.onDiscard != nil {
+			session.onDiscard()
+		}
+		if session.ID > 0 {
+			r.database.EndConnectionLog(session.ID, 0, 0, "PREEMPTED", reason)
+		}
+	}
+
+	r.database.SetAccountStatus(serverAccountID, db.StatusReserved)
+	routerLog.Info("Session preempted for server account %d (reason: %s)", serverAccountID, reason)
+}
+
 // ShouldAcceptCall decides whether an incoming call should be accepted.
 // It checks:
-//  1. The server account is in IDLE or RESERVED state
+//  1. The server account is in IDLE or RESERVED state (or IN_CALL from the SAME paired caller reconnecting)
 //  2. The caller matches the paired client account (if expectedCallerID is set)
 //  3. The call isn't already being handled by another account
 //
@@ -295,11 +321,6 @@ func (r *Router) ShouldAcceptCall(serverAccountID uint, callerID int64, callID i
 	acct, err := r.database.GetAccount(serverAccountID)
 	if err != nil {
 		return fmt.Errorf("account %d not found", serverAccountID)
-	}
-
-	// Check state — only accept if IDLE or RESERVED
-	if acct.Status != db.StatusIdle && acct.Status != db.StatusReserved {
-		return fmt.Errorf("account %d is %s, cannot accept calls", serverAccountID, acct.Status)
 	}
 
 	// Check if the account is enabled
@@ -317,6 +338,21 @@ func (r *Router) ShouldAcceptCall(serverAccountID uint, callerID int64, callID i
 			return fmt.Errorf("caller %d doesn't match paired client %d",
 				callerID, pairing.ClientAccount.BaleUserID)
 		}
+
+		// Intelligent Re-dial Preemption:
+		// If the account is IN_CALL, but the incoming call is from the VERIFIED paired client,
+		// the client has disconnected and is reconnecting. Preempt the stale session immediately!
+		if acct.Status == db.StatusInCall {
+			routerLog.Info("🔄 Reconnecting call %d detected from paired caller %d on server %d — preempting stale session",
+				callID, callerID, serverAccountID)
+			r.PreemptSession(serverAccountID, fmt.Sprintf("re-dial from paired client %d (new call %d)", callerID, callID))
+			return nil
+		}
+	}
+
+	// Check state — only accept if IDLE or RESERVED
+	if acct.Status != db.StatusIdle && acct.Status != db.StatusReserved {
+		return fmt.Errorf("account %d is %s, cannot accept calls", serverAccountID, acct.Status)
 	}
 
 	// Check for duplicate call across all accounts

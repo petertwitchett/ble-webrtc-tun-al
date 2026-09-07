@@ -946,7 +946,7 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	defer listener.Close()
 
 	// Accept the client's QUIC connection (with timeout).
-	const acceptTimeout = 90 * time.Second
+	const acceptTimeout = 40 * time.Second
 	accCtx, accCancel := context.WithTimeout(ctx, acceptTimeout)
 	defer accCancel()
 
@@ -986,7 +986,7 @@ drainLoop:
 	sessionStart := time.Now()
 	gracePeriod := 10 * time.Second
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1022,6 +1022,22 @@ drainLoop:
 				mainLog.Info("%s QUIC connection closed", tag)
 				return
 			default:
+			}
+
+			// Inactivity watchdog: if the SFU reports remote participant disconnected
+			if sfu.IsPeerDisconnected() {
+				mainLog.Warn("%s ⏱️ SFU reported remote peer disconnected — cleanly closing call", tag)
+				adminPanel.AddLog("warn", tag+" ⏱️ Remote peer disconnected — closing call")
+				return
+			}
+
+			// Dead peer detection: zero inbound packets (data or silence) from client for 35s
+			silenceDuration := time.Since(rtpConn.LastInboundTime())
+			if silenceDuration > 35*time.Second {
+				mainLog.Warn("%s ⏱️ Dead peer detected: no inbound packets from client for %v — cleanly closing orphaned call",
+					tag, silenceDuration.Round(time.Second))
+				adminPanel.AddLog("warn", fmt.Sprintf("%s ⏱️ Client inactive for %v — auto-closing call", tag, silenceDuration.Round(time.Second)))
+				return
 			}
 			stats := sfu.GetStats()
 			bytesSent, _ := stats["bytes_sent"].(int64)

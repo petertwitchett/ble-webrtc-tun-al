@@ -211,21 +211,18 @@ drained:
 	}
 }
 
-// initChannelWithRetry wraps initChannelTracked with the three-layer recovery:
+// initChannelWithRetry wraps initChannelTracked with the resilient recovery policy:
 //
 //  1. Layer 1: classify the failure phase and decide a targeted response.
 //  2. Layer 2: for call/SFU-phase failures, run the Clean Hangup Protocol
 //     (endCallForPair) to unstick the paired server before retrying.
-//  3. Exponential backoff with a cap; token/credential failures stop retrying.
-//
-// It returns nil only on a fatal (token) failure or context cancellation,
-// otherwise it keeps retrying until the channel connects successfully — exactly
-// the "repeat until this account connects successfully" requirement.
+//  3. Two-tier backoff cadence:
+//     - Tier 1 (burst): attempts 1-4: 1s, 2s, 4s, 8s (fast recovery for brief outages)
+//     - Tier 2 (sustained): attempts 5+: 15s, 30s, 60s, max 90s with ±20% jitter (low overhead during long outages)
+//  4. Instant wakeup via Network Watcher (tm.NetWakeup()) when network connectivity returns.
+//  5. Retries NEVER give up unless the user explicitly stops or token is revoked.
 func (tm *TunnelManager) initChannelWithRetry(ctx context.Context, idx int, tp config.TokenPair, label string) (*channelState, quic.Connection) {
-	backoff := 3 * time.Second
-	const maxBackoff = 30 * time.Second
-	baleFails := 0
-	const baleFailLimit = 8
+	attempt := 0
 
 	for {
 		select {
@@ -239,45 +236,70 @@ func (tm *TunnelManager) initChannelWithRetry(ctx context.Context, idx int, tp c
 			return ch, qconn
 		}
 
+		attempt++
 		errStr := ""
 		if failErr != nil {
 			errStr = failErr.Error()
 		}
 		cls := tm.classifyError(failPhase, errStr)
-		mainLog.Warn("[%s] init failed at %s (%s) class=%d — applying recovery", label, failPhase, errStr, cls)
+		mainLog.Warn("[%s] init failed at %s (%s) class=%d attempt=%d — applying recovery", label, failPhase, errStr, cls, attempt)
 
 		switch cls {
 		case classBaleConnect:
-			baleFails++
 			if isTokenError(errStr) {
 				tm.setChannelPhase(idx, PhaseError, "token revoked/expired: "+errStr)
 				mainLog.Error("[%s] Stopping retries — token appears invalid", label)
 				return nil, nil
 			}
-			if baleFails >= baleFailLimit {
-				tm.setChannelPhase(idx, PhaseError, fmt.Sprintf("Bale connect failed %d times: %s", baleFails, errStr))
-				mainLog.Error("[%s] Stopping retries after %d Bale connect failures", label, baleFails)
-				return nil, nil
-			}
-			// Network block / throttle — backoff only (no call was started).
+			tm.setChannelPhase(idx, PhaseDisconnected, fmt.Sprintf("Waiting to reconnect (attempt %d): %s", attempt, errStr))
 
 		case classCallPhase, classSFUPhase, classUnknown:
 			// Layer 2: the paired server may be stranded in RESERVED/IN_CALL.
 			// Force it back to IDLE before re-dialing so the retried call is
 			// accepted instead of rejected as "busy".
-			// The channel is dead at this point, so existingClient = nil:
-			// a transient client must be created (no collision risk here).
 			tm.setChannelPhase(idx, PhaseTeardown, "clean hangup of paired server")
 			tm.endCallForPair(ctx, tp, label, nil)
-			baleFails = 0
+			tm.setChannelPhase(idx, PhaseDisconnected, fmt.Sprintf("Reconnecting (attempt %d)...", attempt))
 		}
 
+		// Calculate 2-tier backoff:
+		var sleepDur time.Duration
+		switch {
+		case attempt == 1:
+			sleepDur = 1 * time.Second
+		case attempt == 2:
+			sleepDur = 2 * time.Second
+		case attempt == 3:
+			sleepDur = 4 * time.Second
+		case attempt == 4:
+			sleepDur = 8 * time.Second
+		case attempt == 5:
+			sleepDur = 15 * time.Second
+		case attempt == 6:
+			sleepDur = 30 * time.Second
+		case attempt == 7:
+			sleepDur = 60 * time.Second
+		default:
+			sleepDur = 90 * time.Second
+		}
+
+		if attempt >= 5 {
+			// Add ±20% jitter to prevent thundering herd across arteries
+			jitter := time.Duration((rand.Float64()*0.4 - 0.2) * float64(sleepDur))
+			sleepDur += jitter
+		}
+
+		mainLog.Info("[%s] Next reconnect attempt (#%d) in %v...", label, attempt+1, sleepDur.Round(100*time.Millisecond))
+
+		wakeCh := tm.NetWakeup()
 		select {
 		case <-ctx.Done():
 			return nil, nil
-		case <-time.After(backoff):
+		case <-wakeCh:
+			mainLog.Info("[%s] ⚡ Network restored! Waking up immediately to retry connection", label)
+			attempt = 0 // Reset to tier-1 fast burst
+		case <-time.After(sleepDur):
 		}
-		backoff = min(backoff*2, maxBackoff)
 	}
 }
 
@@ -349,7 +371,11 @@ func (tm *TunnelManager) refreshChannel(
 	tm.setChannelPhase(idx, PhaseBaleConnect, "")
 	newCh, newQConn := tm.initChannelWithRetry(ctx, idx, tp, label)
 	if newCh == nil {
-		tm.setChannelPhase(idx, PhaseError, "reconnect yielded no channel — giving up")
+		if ctx.Err() != nil {
+			tm.setChannelPhase(idx, PhaseDisconnected, "stopped")
+		} else {
+			tm.setChannelPhase(idx, PhaseDisconnected, "reconnect paused")
+		}
 		return
 	}
 

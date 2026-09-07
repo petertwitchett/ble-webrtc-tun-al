@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -282,6 +283,10 @@ type TunnelManager struct {
 	// Wraps the application-level DNS resolver and the split-tunneling bypass
 	// engine.  Hot-swappable from the admin dashboard.
 	routing *RoutingEngine
+
+	// Network reachability watcher and instant wakeup broadcast
+	netUp       atomic.Bool
+	netWakeupCh chan struct{}
 }
 
 func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accounts.Manager) *TunnelManager {
@@ -313,15 +318,18 @@ func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accoun
 		mainLog.Info("✅ Obfuscation disabled — QUIC TLS 1.3 + DTLS/SRTP provides sufficient encryption. Full MTU available.")
 	}
 
-	return &TunnelManager{
-		cfg:        cfg,
-		database:   database,
-		manager:    manager,
-		clientID:   clientID,
-		obfuscator: obf,
-		refresh:    &refreshSupervisor{},
-		routing:    initRoutingEngine(cfg, database),
+	tm := &TunnelManager{
+		cfg:         cfg,
+		database:    database,
+		manager:     manager,
+		clientID:    clientID,
+		obfuscator:  obf,
+		refresh:     &refreshSupervisor{},
+		routing:     initRoutingEngine(cfg, database),
+		netWakeupCh: make(chan struct{}),
 	}
+	tm.netUp.Store(true)
+	return tm
 }
 
 // getObfuscator dynamically retrieves the obfuscator based on config, DB settings, or env.
@@ -342,6 +350,76 @@ func (tm *TunnelManager) getObfuscator() *dcconn.Obfuscator {
 		}
 	}
 	return nil
+}
+
+// startNetworkWatcher continuously checks default gateway/DNS reachability.
+// When internet recovers from offline to online, it broadcasts on netWakeupCh
+// to immediately wake up sleeping channel reconnect loops.
+func (tm *TunnelManager) startNetworkWatcher(ctx context.Context) {
+	tm.netUp.Store(true)
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				reachable := tm.probeNetwork()
+				wasUp := tm.netUp.Swap(reachable)
+
+				if !wasUp && reachable {
+					mainLog.Info("⚡ [NetWatcher] Internet restored! Triggering immediate channel reconnection")
+					tm.broadcastNetWakeup()
+				} else if wasUp && !reachable {
+					mainLog.Warn("🌐 [NetWatcher] Internet connectivity lost — primary internet is down")
+				}
+			}
+		}
+	}()
+}
+
+func (tm *TunnelManager) broadcastNetWakeup() {
+	tm.mu.Lock()
+	ch := tm.netWakeupCh
+	tm.netWakeupCh = make(chan struct{})
+	tm.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+func (tm *TunnelManager) NetWakeup() <-chan struct{} {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return tm.netWakeupCh
+}
+
+func (tm *TunnelManager) isNetworkUp() bool {
+	return tm.netUp.Load()
+}
+
+// probeNetwork tests if raw internet or domestic gateway connectivity exists.
+func (tm *TunnelManager) probeNetwork() bool {
+	probes := []string{
+		"1.1.1.1:53",
+		"8.8.8.8:53",
+		"185.161.112.33:53", // domestic Iran DNS
+	}
+	for _, target := range probes {
+		d := net.Dialer{Timeout: 1200 * time.Millisecond}
+		conn, err := d.Dial("tcp", target)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	var r net.Resolver
+	addrs, err := r.LookupHost(ctx, "web.bale.ai")
+	return err == nil && len(addrs) > 0
 }
 
 // routingSettingKeys are the DB setting keys for the application-level DNS and
@@ -859,6 +937,20 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 	var proxyOnce sync.Once
 	var orchOnce sync.Once
 
+	// Start proactive network reachability monitor
+	tm.startNetworkWatcher(ctx)
+
+	// Ensure SOCKS5 & HTTP proxies are listening immediately on startup so local applications
+	// can bind and route traffic as soon as any artery connects.
+	proxyOnce.Do(func() {
+		go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool, tm.routing)
+		go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool, tm.routing)
+		mainLog.Info(" 🚀 SOCKS5 (:10909) and HTTP (:9095) proxies listening — awaiting active arteries")
+		for _, ip := range getLocalIPs() {
+			mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
+		}
+	})
+
 	// Background health monitor + stats: runs continuously as channels join
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
@@ -886,11 +978,7 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		}
 	}()
 
-	// === SEQUENTIAL CONNECTION WITH INSTANT FIRST-ACCOUNT PROXY ACTIVATION ===
-	// Connect channels sequentially. Each channel fully establishes WebRTC
-	// signaling and dials its own independent QUIC connection before the next
-	// one starts. This avoids concurrent ICE/DTLS negotiations that trigger
-	// gateway/TURN rate limits or drops.
+	// === SEQUENTIAL INITIAL CONNECTION WITH PERSISTENT BACKGROUND RECOVERY ===
 	for i, pair := range pairs {
 		select {
 		case <-ctx.Done():
@@ -903,46 +991,29 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		mainLog.Info("[%s] 🔗 Connecting pair %d/%d (multi-QUIC mode)...", label, i+1, len(pairs))
 
 		ch, qconn := tm.initChannelWithRetry(ctx, i, pair, label)
-		if ch == nil {
-			mainLog.Warn("[%s] ❌ Channel init failed (skipping)", label)
-			continue
-		}
-
-		// Register this lane's independent QUIC connection into the pool
-		// with its pair index for artery telemetry tracking.
-		if qconn != nil {
+		if ch != nil && qconn != nil {
 			tunnelPool.RegisterWithIndex(label, qconn, i)
 			mainLog.Info("[%s] ✅ Independent QUIC connection registered as artery (pool size: %d)", label, tunnelPool.ActiveCount())
+			tm.setChannelPhase(i, PhaseTunnelActive, "")
+			mu.Lock()
+			channels = append(channels, ch)
+			mu.Unlock()
+
+			// Start Artery Orchestrator as soon as the first connection is live
+			orchOnce.Do(func() {
+				orch := tm.startArteryOrchestrator(ctx, tunnelPool, &channels, &mu, pairs)
+				tm.mu.Lock()
+				tm.orchestrator = orch
+				tm.mu.Unlock()
+				mainLog.Info(" 🧠 Artery orchestrator active — autonomous health & load-balancing engaged")
+			})
+		} else {
+			mainLog.Warn("[%s] ⚠️ Initial connect unsuccessful — background continuous recovery engaged", label)
+			tm.setChannelPhase(i, PhaseDisconnected, "initial connection pending")
 		}
 
-		tm.setChannelPhase(i, PhaseTunnelActive, "")
-		mu.Lock()
-		channels = append(channels, ch)
-		mu.Unlock()
-
+		// Launch persistent monitor and recovery loop for EVERY channel
 		go tm.monitorAndReconnect(ctx, tunnelPool, ch, qconn, i, pair, label, &mu, &channels, &proxyOnce)
-
-		// ── FAST ACTIVATION POLICY: START PROXIES ON FIRST CONNECTION ──
-		// As soon as the FIRST connection succeeds, bring SOCKS5 & HTTP online immediately.
-		// Internet traffic starts flowing right away over the live artery.
-		// Subsequent channels will dynamically join the pool and receive traffic via P2C+WRR.
-		proxyOnce.Do(func() {
-			go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool, tm.routing)
-			go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool, tm.routing)
-			mainLog.Info(" 🚀 FAST ONLINE: SOCKS5 (:10909) and HTTP (:9095) proxies are now LIVE on first connection!")
-			for _, ip := range getLocalIPs() {
-				mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
-			}
-		})
-
-		// Start Artery Orchestrator as soon as the first connection is live
-		orchOnce.Do(func() {
-			orch := tm.startArteryOrchestrator(ctx, tunnelPool, &channels, &mu, pairs)
-			tm.mu.Lock()
-			tm.orchestrator = orch
-			tm.mu.Unlock()
-			mainLog.Info(" 🧠 Artery orchestrator active — autonomous health & load-balancing engaged")
-		})
 
 		if tunnelPool.ActiveCount() > 1 {
 			mainLog.Info(" ⚡ [Load Balancer] Added %s to pool — balancing traffic across %d/%d active arteries",
@@ -956,17 +1027,13 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 
 	active := tunnelPool.ActiveCount()
 	if active == 0 {
-		mainLog.Info("[Main] ❌ No channels established! Cannot start proxy.")
-		tm.mu.Lock()
-		tm.lastError = "all channels failed to connect"
-		tm.mu.Unlock()
-		tm.Stop()
-		return
+		mainLog.Warn(" ⚠️ [Main] 0/%d channels currently active — persistent background recovery active", len(pairs))
+	} else {
+		mainLog.Info(" 🟢 %d/%d channels active in pool", active, len(pairs))
 	}
-	mainLog.Info(" 🟢 All %d pairs connected/evaluated — %d/%d channels active in pool", len(pairs), active, len(pairs))
 
-	// Liveness monitor: wait until ctx cancelled or all channels die
-	ticker := time.NewTicker(3 * time.Second)
+	// Liveness monitor: wait until ctx is cancelled by explicit user action
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -997,14 +1064,10 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 			return
 
 		case <-ticker.C:
+			// Continuous status check — NEVER stop automatically
 			act := tunnelPool.ActiveCount()
 			if act == 0 {
-				mainLog.Info("[Health] ❌ All channels dead!")
-				tm.mu.Lock()
-				tm.lastError = "all channels disconnected"
-				tm.mu.Unlock()
-				tm.Stop()
-				return
+				// Channels recovering in background
 			}
 		}
 	}
@@ -1034,22 +1097,20 @@ func (tm *TunnelManager) monitorAndReconnect(
 	channels *[]*channelState,
 	proxyOnce *sync.Once,
 ) {
-	backoff := 3 * time.Second
-	const maxBackoff = 30 * time.Second
-
 	currentQConn := qconn
 	currentCh := ch
+	consecutiveFails := 0
 
 	// Layer 3: per-channel randomized refresh deadline.
 	refreshAt := time.Now().Add(tm.nextRefreshInterval())
 	mainLog.Info("[%s] 🔄 Next scheduled refresh in %v", label, time.Until(refreshAt).Round(time.Second))
 
 	for {
-		// ── Liveness check every 3s ───────────────────────────────────────
+		// ── Liveness check every 2s ───────────────────────────────────────
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(3 * time.Second):
+		case <-time.After(2 * time.Second):
 		}
 
 		// ── Layer 3: Staggered Refresh ────────────────────────────────────
@@ -1064,30 +1125,10 @@ func (tm *TunnelManager) monitorAndReconnect(
 				tm.refresh.release()
 
 				if currentCh != nil && currentQConn != nil {
-					backoff = 3 * time.Second
-				proxyOnce.Do(func() {
-					go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool, tm.routing)
-					go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool, tm.routing)
-				})
-				refreshAt = time.Now().Add(tm.nextRefreshInterval())
+					consecutiveFails = 0
+					refreshAt = time.Now().Add(tm.nextRefreshInterval())
 					mainLog.Info("[%s] 🔄 Next scheduled refresh in %v", label, time.Until(refreshAt).Round(time.Second))
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(2 * time.Second):
-					}
 					continue
-				}
-				// Refresh failed. Check if fatal.
-				tm.channelMu.RLock()
-				var curPhase ChannelPhase
-				if idx < len(tm.channelStatus) {
-					curPhase = tm.channelStatus[idx].Phase
-				}
-				tm.channelMu.RUnlock()
-				if curPhase == PhaseError {
-					mainLog.Error("[%s] ❌ Refresh hit PhaseError — terminating monitor goroutine", label)
-					return
 				}
 				refreshAt = time.Now().Add(time.Duration(2+rand.Intn(4)) * time.Minute)
 			} else {
@@ -1102,38 +1143,25 @@ func (tm *TunnelManager) monitorAndReconnect(
 		dead := false
 		reason := ""
 
-		if currentCh == nil && currentQConn == nil {
-			tm.channelMu.RLock()
-			var curPhase ChannelPhase
-			if idx < len(tm.channelStatus) {
-				curPhase = tm.channelStatus[idx].Phase
-			}
-			tm.channelMu.RUnlock()
-			if curPhase == PhaseError {
-				mainLog.Error("[%s] ❌ PhaseError with nil channel — terminating monitor goroutine", label)
-				return
-			}
-			mainLog.Warn("[%s] ⚠️  Ghost state detected (nil pointers, phase=%s) — forcing reconnect", label, curPhase)
+		if currentCh == nil || currentQConn == nil {
 			dead = true
-			reason = "ghost nil pointers"
-		}
-
-		// Check 1: QUIC connection context
-		if currentQConn != nil {
+			reason = "channel offline"
+		} else {
+			// Check 1: QUIC connection context
 			select {
 			case <-currentQConn.Context().Done():
 				dead = true
 				reason = "QUIC context cancelled"
 			default:
 			}
-		}
 
-		// Check 2: WebRTC ICE state
-		if !dead && currentCh != nil && currentCh.sfu != nil {
-			health := currentCh.sfu.GetHealth()
-			if health.PubICEState == "disconnected" || health.PubICEState == "failed" {
-				dead = true
-				reason = "WebRTC ICE " + health.PubICEState
+			// Check 2: WebRTC ICE state
+			if !dead && currentCh.sfu != nil {
+				health := currentCh.sfu.GetHealth()
+				if health.PubICEState == "disconnected" || health.PubICEState == "failed" {
+					dead = true
+					reason = "WebRTC ICE " + health.PubICEState
+				}
 			}
 		}
 
@@ -1141,31 +1169,66 @@ func (tm *TunnelManager) monitorAndReconnect(
 			continue
 		}
 
-		// ── Layer 2: death reconnect (with Clean Hangup Protocol) ─────────
-		mainLog.Warn("[%s] 💀 Channel dead (%s) — reconnecting (backoff: %.0fs)", label, reason, backoff.Seconds())
+		// ── Layer 2: Death / Disconnect Reconnect ─────────────────────────
+		consecutiveFails++
+		var sleepDur time.Duration
+		if consecutiveFails <= 4 {
+			// Tier 1: Fast recovery for transient micro-drops (1s, 2s, 4s, 8s)
+			sleepDur = time.Duration(1<<uint(consecutiveFails-1)) * time.Second
+		} else {
+			// Tier 2: Sustained low-overhead cadence for prolonged outages (15s, 30s, 60s, max 90s)
+			switch consecutiveFails {
+			case 5:
+				sleepDur = 15 * time.Second
+			case 6:
+				sleepDur = 30 * time.Second
+			case 7:
+				sleepDur = 60 * time.Second
+			default:
+				sleepDur = 90 * time.Second
+			}
+		}
+		// Apply ±20% randomized jitter
+		jitter := time.Duration((rand.Float64()*0.4 - 0.2) * float64(sleepDur))
+		actualSleep := sleepDur + jitter
+		if actualSleep < 1*time.Second {
+			actualSleep = 1 * time.Second
+		}
+
+		mainLog.Warn("[%s] 💀 Channel offline (%s, attempt #%d) — reconnecting in %.1fs",
+			label, reason, consecutiveFails, actualSleep.Seconds())
 		tm.setChannelPhase(idx, PhaseDisconnected, reason)
+
+		// Wait for sleep interval OR instant network recovery signal
+		if !tm.isNetworkUp() {
+			mainLog.Warn("[%s] 🌐 Primary internet appears down — waiting for network recovery", label)
+			select {
+			case <-ctx.Done():
+				return
+			case <-tm.NetWakeup():
+				mainLog.Info("[%s] ⚡ Internet restored! Immediate reconnection attempt...", label)
+			case <-time.After(30 * time.Second):
+			}
+		} else {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tm.NetWakeup():
+				mainLog.Info("[%s] ⚡ Network recovery signal received — immediate reconnect attempt", label)
+			case <-time.After(actualSleep):
+			}
+		}
 
 		tm.refreshChannel(ctx, tunnelPool, &currentCh, &currentQConn, idx, tp, label, mu, channels)
 
 		if currentCh == nil || currentQConn == nil {
-			mainLog.Warn("[%s] ❌ Reconnect failed — retrying in %.0fs", label, backoff.Seconds())
-			backoff = min(backoff*2, maxBackoff)
+			mainLog.Warn("[%s] ❌ Reconnect attempt #%d failed — persistent recovery will retry", label, consecutiveFails)
 			continue
 		}
 
-		mainLog.Info("[%s] ✅ Reconnected!", label)
-		backoff = 3 * time.Second
-
-	proxyOnce.Do(func() {
-		go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool, tm.routing)
-		go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool, tm.routing)
-	})
-
-	select {
-		case <-ctx.Done():
-			return
-		case <-time.After(2 * time.Second):
-		}
+		mainLog.Info("[%s] ✅ Reconnected successfully! (recovered after %d attempts)", label, consecutiveFails)
+		consecutiveFails = 0
+		refreshAt = time.Now().Add(tm.nextRefreshInterval())
 	}
 }
 

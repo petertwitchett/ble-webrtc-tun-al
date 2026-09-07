@@ -634,6 +634,13 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 		})
 
 		sessionCtx, sessionCancel := context.WithCancel(ctx)
+		if session != nil {
+			session.SetCancelFunc(sessionCancel)
+			cID := call.CallID
+			session.SetDiscardFunc(func() {
+				client.DiscardCall(cID)
+			})
+		}
 		mainLog.Info("%s Connecting to LiveKit SFU...", tag)
 
 		sfuTransport := livekit.NewSFUTransport(&sessionCfg, serverObf)

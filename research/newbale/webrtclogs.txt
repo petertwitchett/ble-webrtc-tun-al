@@ -1,0 +1,243 @@
+Create a WebRTC-Internals dump
+Download the "webrtc-internals dump"  Compress result
+The "webrtc-internals" dump is a JSON file containing API calls, events and getStats-like information about RTCPeerConnection objects as well as getUsermedia/getDisplayMedia API calls.
+
+Create diagnostic audio recordings
+ Enable diagnostic audio recordings
+
+A diagnostic audio recording is used for analyzing audio problems. It consists of several files and contains the audio played out to the speaker (output) and captured from the microphone (input). The data is saved locally. Checking this box will enable recordings of all ongoing input and output audio streams (including non-WebRTC streams) and for future audio streams. When the box is unchecked or this page is closed, all ongoing recordings will be stopped and this recording functionality disabled. Recording audio from multiple tabs is supported as well as multiple recordings from the same tab.
+
+When enabling, select a base filename to which the following suffixes will be added:
+
+<base filename>.<render process ID>.aec_dump.<AEC dump recording ID>
+<base filename>.input.<stream recording ID>.wav
+<base filename>.output.<stream recording ID>.wav
+It is recommended to choose a new base filename each time the feature is enabled to avoid ending up with partially overwritten or unusable audio files.
+
+Create diagnostic packet recordings
+ Enable diagnostic packet and event recording
+
+A diagnostic packet and event recording can be used for analyzing various issues related to thread starvation, jitter buffers or bandwidth estimation. Two types of data are logged. First, incoming and outgoing RTP headers and RTCP packets are logged. These do not include any audio or video information, nor any other types of personally identifiable information (so no IP addresses or URLs). Checking this box will enable the recording for ongoing WebRTC calls and for future WebRTC calls. When the box is unchecked or this page is closed, all ongoing recordings will be stopped and this recording functionality will be disabled for future WebRTC calls. Recording in multiple tabs or multiple recordings in the same tab will cause multiple log files to be created. When enabling, a filename for the recording can be entered. The entered filename is used as a base, to which the following suffixes will be appended.
+
+<base filename>_<date>_<timestamp>_<render process ID>_<recording ID>
+
+If a file with the same name already exists, it will be overwritten. No more than 5 logfiles will be created, and each of them is limited to 60MB of storage. On Android these limits are 3 files of at most 10MB each. When the limit is reached, the checkbox must be unchecked and rechecked to resume logging.
+
+Create DataChannel message recordings
+https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/cr8o6/0x4AAAAAAEI-FEkhfu_tM_le/auto/fbE/auto_timeout/normal?lang=auto [ rid: 32396, lid: 22, pid: 1255359 ]getUserMedia/getDisplayMediahttps://web.bale.ai/chat?uid=1595609526 [ rid: 32656, lid: 1, pid: 1267692 ]
+https://web.bale.ai/chat?uid=1595609526, { iceServers: [turns:turn-em.ble.ir:443?transport=tcp, stun:2.188.186.75:443, stun:stun.l.google.com:19302], iceTransportPolicy: all, bundlePolicy: balanced, rtcpMuxPolicy: require, iceCandidatePoolSize: 0 },
+
+ICE connection state: new => checking => connected
+Connection state: new => connecting => connected
+Signaling state: new => have-local-offer => stable => have-local-offer => stable => have-local-offer => stable => have-local-offer => stable => have-local-offer => ...
+ICE Candidate pair: 2.188.186.75:49727 <=>2.188.186.68:47897
+ICE candidate grid
+Time	Event
+9/7/2026, 7:43:29 AM	
+createDataChannel
+9/7/2026, 7:43:29 AM	
+createDataChannel
+9/7/2026, 7:43:29 AM	
+createDataChannel
+9/7/2026, 7:43:29 AM	
+transceiverAdded [0], audio
+9/7/2026, 7:43:29 AM	
+transceiverAdded [1], audio
+9/7/2026, 7:43:29 AM	
+transceiverAdded [2], audio
+9/7/2026, 7:43:29 AM	
+transceiverAdded [3], video
+9/7/2026, 7:43:29 AM	
+transceiverAdded [4], video
+9/7/2026, 7:43:29 AM	
+transceiverAdded [5], video
+9/7/2026, 7:43:29 AM	
+createOffer
+9/7/2026, 7:43:29 AM	negotiationneeded
+9/7/2026, 7:43:29 AM	
+createOfferOnSuccess (type: "offer", 8 sections)
+9/7/2026, 7:43:30 AM	
+setConfiguration
+9/7/2026, 7:43:30 AM	
+setLocalDescription (munged) (type: "offer", 8 sections)
+9/7/2026, 7:43:30 AM	setLocalDescriptionOnSuccess
+9/7/2026, 7:43:30 AM	
+signalingstatechange
+9/7/2026, 7:43:30 AM	
+transceiverModified [0], audio
+9/7/2026, 7:43:30 AM	
+transceiverModified [1], audio
+9/7/2026, 7:43:30 AM	
+transceiverModified [2], audio
+9/7/2026, 7:43:30 AM	
+transceiverModified [3], video
+9/7/2026, 7:43:30 AM	
+transceiverModified [4], video
+9/7/2026, 7:43:30 AM	
+transceiverModified [5], video
+9/7/2026, 7:43:30 AM	
+setRemoteDescription (type: "answer", 8 sections)
+9/7/2026, 7:43:30 AM	
+icegatheringstatechange
+9/7/2026, 7:43:30 AM	
+transceiverAdded [6], audio
+9/7/2026, 7:43:30 AM	setRemoteDescriptionOnSuccess
+9/7/2026, 7:43:30 AM	
+signalingstatechange
+9/7/2026, 7:43:30 AM	
+transceiverModified [0], audio
+9/7/2026, 7:43:30 AM	
+transceiverModified [1], audio
+9/7/2026, 7:43:30 AM	
+transceiverModified [2], audio
+9/7/2026, 7:43:30 AM	
+transceiverModified [3], video
+9/7/2026, 7:43:30 AM	
+transceiverModified [4], video
+9/7/2026, 7:43:30 AM	
+transceiverModified [5], video
+9/7/2026, 7:43:30 AM	
+createOffer
+9/7/2026, 7:43:30 AM	
+icecandidate(sdpMid: 0, sdpMLineIndex: 0, type: host, url: )
+9/7/2026, 7:43:30 AM	negotiationneeded
+9/7/2026, 7:43:30 AM	
+addIceCandidate(sdpMid: 0, sdpMLineIndex: 0, type: host)
+9/7/2026, 7:43:30 AM	
+addIceCandidate(sdpMid: 0, sdpMLineIndex: 0, type: host)
+9/7/2026, 7:43:30 AM	
+iceconnectionstatechange
+9/7/2026, 7:43:30 AM	
+connectionstatechange
+9/7/2026, 7:43:30 AM	
+createOfferOnSuccess (type: "offer", 9 sections)
+9/7/2026, 7:43:30 AM	
+setLocalDescription (munged) (type: "offer", 9 sections)
+9/7/2026, 7:43:30 AM	
+icecandidateerror
+9/7/2026, 7:43:30 AM	setLocalDescriptionOnSuccess
+9/7/2026, 7:43:30 AM	
+signalingstatechange
+9/7/2026, 7:43:30 AM	
+transceiverModified [6], audio
+9/7/2026, 7:43:30 AM	
+setRemoteDescription (type: "answer", 9 sections)
+9/7/2026, 7:43:30 AM	setRemoteDescriptionOnSuccess
+9/7/2026, 7:43:30 AM	
+signalingstatechange
+9/7/2026, 7:43:30 AM	
+transceiverModified [6], audio
+9/7/2026, 7:43:30 AM	
+createOffer
+9/7/2026, 7:43:30 AM	
+createOfferOnSuccess (type: "offer", 9 sections)
+9/7/2026, 7:43:30 AM	
+setLocalDescription (munged) (type: "offer", 9 sections)
+9/7/2026, 7:43:30 AM	setLocalDescriptionOnSuccess
+9/7/2026, 7:43:30 AM	
+signalingstatechange
+9/7/2026, 7:43:30 AM	
+setRemoteDescription (type: "answer", 9 sections)
+9/7/2026, 7:43:30 AM	setRemoteDescriptionOnSuccess
+9/7/2026, 7:43:30 AM	
+signalingstatechange
+9/7/2026, 7:43:30 AM	
+icecandidate(sdpMid: 0, sdpMLineIndex: 0, type: relay, url: turns:turn-em.ble.ir:443?transport=tcp, relayProtocol: tls)
+9/7/2026, 7:43:30 AM	
+icecandidate(sdpMid: 0, sdpMLineIndex: 0, type: relay, url: turns:turn-em.ble.ir:443?transport=tcp, relayProtocol: tls)
+9/7/2026, 7:43:30 AM	
+iceconnectionstatechange
+9/7/2026, 7:43:30 AM	
+icegatheringstatechange
+9/7/2026, 7:43:30 AM	
+connectionstatechange
+9/7/2026, 7:43:30 AM	
+transceiverAdded [7], video
+9/7/2026, 7:43:30 AM	negotiationneeded
+9/7/2026, 7:43:30 AM	
+createOffer
+9/7/2026, 7:43:30 AM	
+createOfferOnSuccess (type: "offer", 10 sections)
+9/7/2026, 7:43:30 AM	
+setLocalDescription (munged) (type: "offer", 10 sections)
+9/7/2026, 7:43:30 AM	setLocalDescriptionOnSuccess
+9/7/2026, 7:43:30 AM	
+signalingstatechange
+9/7/2026, 7:43:30 AM	
+transceiverModified [7], video
+9/7/2026, 7:43:30 AM	
+setRemoteDescription (type: "answer", 10 sections)
+9/7/2026, 7:43:30 AM	setRemoteDescriptionOnSuccess
+9/7/2026, 7:43:30 AM	
+signalingstatechange
+9/7/2026, 7:43:30 AM	
+transceiverModified [7], video
+9/7/2026, 7:43:40 AM	
+createOffer
+9/7/2026, 7:43:40 AM	
+createOfferOnSuccess (type: "offer", 10 sections)
+9/7/2026, 7:43:40 AM	
+setLocalDescription (munged) (type: "offer", 10 sections)
+9/7/2026, 7:43:40 AM	setLocalDescriptionOnSuccess
+9/7/2026, 7:43:40 AM	
+signalingstatechange
+9/7/2026, 7:43:40 AM	
+setRemoteDescription (type: "answer", 10 sections)
+9/7/2026, 7:43:40 AM	setRemoteDescriptionOnSuccess
+9/7/2026, 7:43:40 AM	
+signalingstatechange
+9/7/2026, 7:44:10 AM	
+icecandidateerror
+9/7/2026, 7:44:10 AM	
+icecandidateerror
+Stats Tables
+Filter statistics by type including 
+separate multiple values by `,`
+media-playout (kind=audio, id=AP)
+certificate (id=CF4F:9A:6E:99:FF:61:AE:28:C7:3D:94:8F:F7:43:AB:3C:05:8A:4C:45:F3:97:10:79:59:94:59:8D:B3:27:38:6E)
+codec (mimeType=audio/opus, payloadType=111, id=COT01_111_minptime=10;usedtx=1;useinbandfec=1)
+candidate-pair (state=in-progress, id=CPxvQZ8HnZ_+Z5IumSS)
+data-channel (id=D1)
+data-channel (id=D2)
+data-channel (id=D3)
+remote-candidate (candidateType=host, id=I+Z5IumSS)
+local-candidate (candidateType=host, id=ICgHlVbQu)
+local-candidate (candidateType=host, tcpType=active, id=IG1GUN/yG)
+local-candidate (candidateType=host, tcpType=active, id=IJMcU0WGl)
+local-candidate (candidateType=host, id=IxvQZ8HnZ)
+outbound-rtp (kind=audio, mid=7, ssrc=796853355, [codec]=opus (111, minptime=10;usedtx=1;useinbandfec=1), id=OT01A796853355)
+peer-connection (id=P)
+media-source (kind=audio, id=SA1)
+transport (iceState=connected, dtlsState=connected, id=T01)
+certificate (id=CFFE:F7:B4:AD:6E:FE:D0:4C:23:43:89:CB:50:B6:FF:EC:B4:03:27:DC:51:D0:E5:7B:76:03:3E:0B:A1:3C:BC:DA)
+codec (mimeType=video/VP9, payloadType=98, id=COT01_98_profile-id=0;x-google-start-bitrate=700)
+candidate-pair (state=succeeded, id=CPE2uOejvy_+Z5IumSS)
+candidate-pair (state=waiting, id=CPuRsd6vKa_+Z5IumSS)
+local-candidate (candidateType=relay, relayProtocol=tls, id=IE2uOejvy)
+local-candidate (candidateType=relay, relayProtocol=tls, id=IuRsd6vKa)
+outbound-rtp (kind=video, mid=8, ssrc=1523466344, rtxSsrc=3878656174, frameHeight=480, scalabilityMode=L2T3_KEY, encoderImplementation=libvpx, powerEfficientEncoder=false, [codec]=VP9 (98, profile-id=0;x-google-start-bitrate=700), id=OT01V1523466344)
+media-source (kind=video, id=SV2)
+remote-inbound-rtp (kind=audio, ssrc=796853355, id=RIA796853355)
+remote-inbound-rtp (kind=video, ssrc=1523466344, id=RIV1523466344)
+codec (mimeType=audio/opus, payloadType=111, id=CIT01_111_minptime=10;stereo=1;useinbandfec=1)
+inbound-rtp (kind=audio, mid=0, ssrc=4100481782, [codec]=opus (111, minptime=10;stereo=1;useinbandfec=1), id=IT01A4100481782)
+remote-outbound-rtp (kind=audio, ssrc=4100481782, id=ROA4100481782)
+Filter statistics graphs by type including 
+separate multiple values by `,`
+Stats graphs for media-playout (kind=audio, id=AP)
+Stats graphs for candidate-pair (state=in-progress, id=CPxvQZ8HnZ_+Z5IumSS)
+Stats graphs for outbound-rtp (kind=audio, mid=7, ssrc=796853355, [codec]=opus (111, minptime=10;usedtx=1;useinbandfec=1), id=OT01A796853355)
+Stats graphs for peer-connection (id=P)
+Stats graphs for media-source (kind=audio, id=SA1)
+Stats graphs for candidate-pair (state=succeeded, id=CPE2uOejvy_+Z5IumSS)
+Stats graphs for candidate-pair (state=waiting, id=CPuRsd6vKa_+Z5IumSS)
+Stats graphs for data-channel (id=D1)
+Stats graphs for data-channel (id=D2)
+Stats graphs for data-channel (id=D3)
+Stats graphs for outbound-rtp (kind=video, mid=8, ssrc=1523466344, rtxSsrc=3878656174, frameHeight=480, scalabilityMode=L2T3_KEY, encoderImplementation=libvpx, powerEfficientEncoder=false, [codec]=VP9 (98, profile-id=0;x-google-start-bitrate=700), id=OT01V1523466344)
+Stats graphs for media-source (kind=video, id=SV2)
+Stats graphs for transport (iceState=connected, dtlsState=connected, id=T01)
+Stats graphs for remote-inbound-rtp (kind=audio, ssrc=796853355, id=RIA796853355)
+Stats graphs for remote-inbound-rtp (kind=video, ssrc=1523466344, id=RIV1523466344)
+Stats graphs for inbound-rtp (kind=audio, mid=0, ssrc=4100481782, [codec]=opus (111, minptime=10;stereo=1;useinbandfec=1), id=IT01A4100481782)
+Stats graphs for remote-outbound-rtp (kind=audio, ssrc=4100481782, id=ROA4100481782)

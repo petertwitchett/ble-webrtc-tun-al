@@ -65,13 +65,15 @@ const maxScriptChunks = 30
 // Script source discovery in the landing HTML.
 var reScriptSrc = regexp.MustCompile(`src=["']([^"']*\.js[^"']*)["']`)
 
-// app_version — 5-7 digit integer in patterns like appVersion:"154014".
+// app_version — 5-7 digit integer in patterns like SENTRY_RELEASE={id:"web@5.5.1+169491"} or appVersion:"169491".
 var reAppVersion = []*regexp.Regexp{
+	regexp.MustCompile(`SENTRY_RELEASE=\{id:["']web@[^"']*\+(\d{5,7})["']\}`),
+	regexp.MustCompile(`appversion:String\(["'](\d{5,7})["']\)`),
+	regexp.MustCompile(`buildNumber[:\s=]+["']?(\d{5,7})["']?`),
 	regexp.MustCompile(`[Aa]pp[Vv]ersion[:\s=]+["']?(\d{5,7})["']?`),
 	regexp.MustCompile(`APP_VERSION[:\s=]+["']?(\d{5,7})["']?`),
 	regexp.MustCompile(`"app_version"\s*,\s*"(\d{5,7})"`),
 	regexp.MustCompile(`"app_version":\s*(\d{5,7})`),
-	regexp.MustCompile(`buildNumber[:\s=]+["']?(\d{5,7})["']?`),
 }
 
 // API key — 64-char uppercase hex near id:4 (Web app_id).

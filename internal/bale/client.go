@@ -1244,12 +1244,23 @@ func buildRPCMessage(service, method string, request []byte, seq uint32) []byte 
 }
 
 func buildMetadata() []byte {
+	sessionID := fmt.Sprintf("%d", time.Now().UnixMilli())
+	appVer := AppVersion()
+	browserVer := BrowserVersion()
+
 	pairs := [][2]string{
-		{"app_version", AppVersion()},
+		{"app_version", appVer},
 		{"browser_type", "1"},
-		{"browser_version", BrowserVersion()},
+		{"browser_version", browserVer},
 		{"os_type", "4"},
-		{"session_id", fmt.Sprintf("%d", time.Now().UnixMilli())},
+		{"session_id", sessionID},
+		{"mt_app_version", appVer},
+		{"mt_browser_type", "1"},
+		{"mt_browser_version", browserVer},
+		{"mt_os_type", "4"},
+		{"mt_session_id", sessionID},
+		{"language", "fa"},
+		{"mt_language", "fa"},
 	}
 
 	var meta []byte

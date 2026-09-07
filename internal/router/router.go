@@ -34,6 +34,17 @@ type Session struct {
 	RoomID          string        // LiveKit room ID
 	StartTime       time.Time     // When the session began
 	cancelFn        context.CancelFunc
+	onDiscard       func()
+}
+
+// SetCancelFunc sets the context cancellation function for the active session.
+func (s *Session) SetCancelFunc(fn context.CancelFunc) {
+	s.cancelFn = fn
+}
+
+// SetDiscardFunc sets the DiscardCall callback to disconnect the call on Bale's backend.
+func (s *Session) SetDiscardFunc(fn func()) {
+	s.onDiscard = fn
 }
 
 // Router manages the state machine and call routing decisions.
@@ -324,6 +335,19 @@ func (r *Router) ShouldAcceptCall(serverAccountID uint, callerID int64, callID i
 
 // ForceEndCall forcibly terminates a session (used from admin panel).
 func (r *Router) ForceEndCall(serverAccountID uint) {
+	r.mu.Lock()
+	session, exists := r.sessions[serverAccountID]
+	r.mu.Unlock()
+
+	if exists && session != nil {
+		if session.cancelFn != nil {
+			session.cancelFn()
+		}
+		if session.onDiscard != nil {
+			session.onDiscard()
+		}
+	}
+
 	r.EndCall(serverAccountID, 0, 0, "ADMIN_FORCE_KILL")
 }
 

@@ -167,11 +167,13 @@ func fetchLatestAppVersion(httpClient *http.Client) (string, error) {
 	//    appVersion:"154014"   APP_VERSION:"154014"   "app_version","154014"
 	//    version:154014        appVersion=154014
 	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`SENTRY_RELEASE=\{id:["']web@[^"']*\+(\d{5,7})["']\}`),
+		regexp.MustCompile(`appversion:String\(["'](\d{5,7})["']\)`),
+		regexp.MustCompile(`buildNumber[:\s=]+["']?(\d{5,7})["']?`),
 		regexp.MustCompile(`[Aa]pp[Vv]ersion[:\s=]+["']?(\d{5,7})["']?`),
 		regexp.MustCompile(`APP_VERSION[:\s=]+["']?(\d{5,7})["']?`),
 		regexp.MustCompile(`"app_version"\s*,\s*"(\d{5,7})"`),
 		regexp.MustCompile(`"app_version":(\d{5,7})`),
-		regexp.MustCompile(`buildNumber[:\s=]+["']?(\d{5,7})["']?`),
 	}
 	for _, pat := range patterns {
 		if m := pat.FindStringSubmatch(jsStr); len(m) >= 2 {
@@ -391,7 +393,7 @@ func (a *AuthClient) doGRPCRequestFull(path string, body []byte) ([]byte, http.H
 	optionsReq, _ := http.NewRequest("OPTIONS", url, nil)
 	optionsReq.Header.Set("Origin", origin)
 	optionsReq.Header.Set("Access-Control-Request-Method", "POST")
-	optionsReq.Header.Set("Access-Control-Request-Headers", "app_version,browser_type,browser_version,content-type,mt_app_version,mt_browser_type,mt_browser_version,mt_os_type,mt_session_id,os_type,session_id,x-grpc-web")
+	optionsReq.Header.Set("Access-Control-Request-Headers", "app_version,browser_type,browser_version,content-type,language,mt_app_version,mt_browser_type,mt_browser_version,mt_language,mt_os_type,mt_session_id,os_type,session_id,x-grpc-web")
 	optionsReq.Header.Set("User-Agent", ua)
 	a.httpClient.Do(optionsReq)
 
@@ -414,7 +416,7 @@ func (a *AuthClient) doGRPCRequestFull(path string, body []byte) ([]byte, http.H
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-site")
-	req.Header.Set("sec-ch-ua", `"Not)A;Brand";v="8", "Chromium";v="`+chromeMajor+`"`)
+	req.Header.Set("sec-ch-ua", fmt.Sprintf(`"Not=A?Brand";v="99", "Google Chrome";v="%s", "Chromium";v="%s"`, chromeMajor, chromeMajor))
 	req.Header.Set("sec-ch-ua-mobile", "?0")
 	req.Header.Set("sec-ch-ua-platform", `"Linux"`)
 	req.Header.Set("session_id", a.sessionID)
@@ -427,6 +429,8 @@ func (a *AuthClient) doGRPCRequestFull(path string, body []byte) ([]byte, http.H
 	req.Header.Set("mt_browser_version", bv)
 	req.Header.Set("app_version", appVer)
 	req.Header.Set("mt_app_version", appVer)
+	req.Header.Set("language", "fa")
+	req.Header.Set("mt_language", "fa")
 	req.Header.Set("DNT", "1")
 	req.Header.Set("Sec-GPC", "1")
 

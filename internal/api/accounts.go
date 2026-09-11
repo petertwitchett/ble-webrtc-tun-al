@@ -326,17 +326,15 @@ func extractUserIDFromToken(token string) int64 {
 	return claims.Payload.UserID
 }
 
-// handleAvailableServers returns server accounts that are available for pairing
-// by the given owner. Excludes server accounts already paired by OTHER owners.
-// GET /api/accounts/available-servers?owner_id=xxx
+// handleAvailableServers returns all enabled server accounts available for pairing.
+// GET /api/accounts/available-servers
 func (s *Server) handleAvailableServers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	ownerID := r.URL.Query().Get("owner_id")
-	accounts, err := s.manager.GetAvailableServerAccounts(ownerID)
+	accounts, err := s.manager.GetAvailableServerAccounts("")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

@@ -24,7 +24,7 @@ export interface PanelSettings {
 
 const defaults: PanelSettings = {
   color: 'indigo',
-  mode: 'dark',
+  mode: 'light',
   sidebarCollapsed: false,
   refreshInterval: 5,
   historyLimit: 50,
@@ -43,6 +43,19 @@ const ThemeContext = createContext<ThemeContextType>({
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [settings, setSettings] = useState<PanelSettings>(() => {
     try {
+      const themeVersion = localStorage.getItem('panel_theme_version');
+      if (themeVersion !== 'light_v1') {
+        // Upgrade legacy default (which was dark) to the new light default
+        localStorage.setItem('panel_theme_version', 'light_v1');
+        const saved = localStorage.getItem('panel_settings');
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          const updated = { ...defaults, ...parsed, mode: 'light' as ThemeMode };
+          localStorage.setItem('panel_settings', JSON.stringify(updated));
+          return updated;
+        }
+        return defaults;
+      }
       const saved = localStorage.getItem('panel_settings');
       return saved ? { ...defaults, ...JSON.parse(saved) } : defaults;
     } catch {

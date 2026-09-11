@@ -16,12 +16,14 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/salman/ble-webrtc-tun/internal/accounts"
 	"github.com/salman/ble-webrtc-tun/internal/api"
+	"github.com/salman/ble-webrtc-tun/internal/artery"
 	"github.com/salman/ble-webrtc-tun/internal/bale"
 	"github.com/salman/ble-webrtc-tun/internal/config"
 	"github.com/salman/ble-webrtc-tun/internal/db"
@@ -73,6 +75,14 @@ func main() {
 		mainLog.Fatal(" Database init failed: %v", err)
 	}
 	defer clientDB.Close()
+
+	// Load persisted Bale client-emulation constants from the database, then
+	// refresh from the live Bale bundle.  Bale silently stops delivering push
+	// events to clients whose app_version is too old, so we always fetch the
+	// latest before creating any bale.Client.
+	bale.LoadFromSettings(clientDB)
+	bale.FetchAndUpdateClientMeta()
+	bale.PersistToSettings(clientDB)
 
 	// Auto-migrate from .env.tokens if DB is empty
 	acctCount, _ := clientDB.CountAccounts("", "")
@@ -141,9 +151,8 @@ func main() {
 	apiSrv.OnTunnelStart = func() error {
 		return tm.Start()
 	}
-	apiSrv.OnTunnelStop = func() error {
-		tm.Stop()
-		return nil
+	apiSrv.OnTunnelStop = func() (map[string]interface{}, error) {
+		return tm.StopAndEndCalls()
 	}
 	apiSrv.GetTunnelStatus = func() (interface{}, error) {
 		return tm.GetDetailedStatus(), nil
@@ -153,6 +162,17 @@ func main() {
 	}
 	apiSrv.OnForceEndCall = func() (map[string]interface{}, error) {
 		return tm.ForceEndCall()
+	}
+	apiSrv.GetRoutingSettings = func() (map[string]string, error) {
+		primary, secondary, bypass := tm.GetRoutingSettings()
+		return map[string]string{
+			"dns_primary":    primary,
+			"dns_secondary":  secondary,
+			"bypass_domains": bypass,
+		}, nil
+	}
+	apiSrv.OnReloadRouting = func(primary, secondary, bypass string) error {
+		return tm.ReloadRouting(primary, secondary, bypass)
 	}
 
 	mainLog.Info("Client initialized. Use admin panel to add accounts, create pairings, and connect.")
@@ -206,18 +226,19 @@ type ChannelStatus struct {
 
 // TunnelStatus is the detailed status returned by the API.
 type TunnelStatus struct {
-	Active         bool            `json:"active"`
-	Phase          string          `json:"phase"` // overall phase
-	ClientID       string          `json:"client_id"`
-	Channels       []ChannelStatus `json:"channels"`
-	TotalChannels  int             `json:"total_channels"`
-	ActiveCount    int             `json:"active_count"`
-	TotalSent      int64           `json:"total_sent"`
-	TotalReceived  int64           `json:"total_received"`
-	StartedAt      *time.Time      `json:"started_at,omitempty"`
-	Error          string          `json:"error,omitempty"`
-	Mode           string          `json:"mode"` // "pairing" or "smart"
-	ProxyAddresses []ProxyAddress  `json:"proxy_addresses,omitempty"`
+	Active          bool                  `json:"active"`
+	Phase           string                `json:"phase"` // overall phase
+	ClientID        string                `json:"client_id"`
+	Channels        []ChannelStatus       `json:"channels"`
+	Arteries        []artery.ArteryStatus `json:"arteries,omitempty"` // Per-artery telemetry
+	TotalChannels   int                   `json:"total_channels"`
+	ActiveCount     int                   `json:"active_count"`
+	TotalSent       int64                 `json:"total_sent"`
+	TotalReceived   int64                 `json:"total_received"`
+	StartedAt       *time.Time            `json:"started_at,omitempty"`
+	Error           string                `json:"error,omitempty"`
+	Mode            string                `json:"mode"` // "pairing" or "smart"
+	ProxyAddresses  []ProxyAddress        `json:"proxy_addresses,omitempty"`
 }
 
 // ProxyAddress represents a single proxy listener address.
@@ -254,6 +275,18 @@ type TunnelManager struct {
 
 	// Layer 3: staggered refresh coordinator (concurrency ticket + quorum lock)
 	refresh *refreshSupervisor
+
+	// Artery orchestrator (autonomous health management)
+	orchestrator *artery.Orchestrator
+
+	// Routing engine — client-side traffic classification and DNS resolution.
+	// Wraps the application-level DNS resolver and the split-tunneling bypass
+	// engine.  Hot-swappable from the admin dashboard.
+	routing *RoutingEngine
+
+	// Network reachability watcher and instant wakeup broadcast
+	netUp       atomic.Bool
+	netWakeupCh chan struct{}
 }
 
 func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accounts.Manager) *TunnelManager {
@@ -261,14 +294,21 @@ func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accoun
 	clientID := getOrCreateClientID(database)
 	mainLog.Info("Client ID: %s", clientID)
 
-	// Obfuscation: XChaCha20-Poly1305 over the RTP payloads.
-	// NOTE: With QUIC (TLS 1.3) + WebRTC (DTLS/SRTP), the payload is already
-	// triple-encrypted. Leaving OBFUSCATION_SECRET empty is RECOMMENDED for
-	// maximum speed — it eliminates 40 bytes/pkt overhead and CPU cycles.
+	// Obfuscation: XChaCha20-Poly1305 over RTP payloads.
+	secret := cfg.ObfuscationSecret
+	if secret == "" && database != nil {
+		if s, err := database.GetSetting("obfuscation_secret"); err == nil && s != "" {
+			secret = s
+		}
+	}
+	if secret == "" {
+		secret = os.Getenv("OBFUSCATION_SECRET")
+	}
+
 	var obf *dcconn.Obfuscator
-	if cfg.ObfuscationSecret != "" {
+	if secret != "" {
 		var err error
-		obf, err = dcconn.NewObfuscator(cfg.ObfuscationSecret)
+		obf, err = dcconn.NewObfuscator(secret)
 		if err != nil {
 			mainLog.Error("Failed to create obfuscator: %v (running without obfuscation)", err)
 		} else {
@@ -278,14 +318,144 @@ func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accoun
 		mainLog.Info("✅ Obfuscation disabled — QUIC TLS 1.3 + DTLS/SRTP provides sufficient encryption. Full MTU available.")
 	}
 
-	return &TunnelManager{
-		cfg:        cfg,
-		database:   database,
-		manager:    manager,
-		clientID:   clientID,
-		obfuscator: obf,
-		refresh:    &refreshSupervisor{},
+	tm := &TunnelManager{
+		cfg:         cfg,
+		database:    database,
+		manager:     manager,
+		clientID:    clientID,
+		obfuscator:  obf,
+		refresh:     &refreshSupervisor{},
+		routing:     initRoutingEngine(cfg, database),
+		netWakeupCh: make(chan struct{}),
 	}
+	tm.netUp.Store(true)
+	return tm
+}
+
+// getObfuscator dynamically retrieves the obfuscator based on config, DB settings, or env.
+func (tm *TunnelManager) getObfuscator() *dcconn.Obfuscator {
+	secret := tm.cfg.ObfuscationSecret
+	if secret == "" && tm.database != nil {
+		if s, err := tm.database.GetSetting("obfuscation_secret"); err == nil && s != "" {
+			secret = s
+		}
+	}
+	if secret == "" {
+		secret = os.Getenv("OBFUSCATION_SECRET")
+	}
+	if secret != "" {
+		obf, err := dcconn.NewObfuscator(secret)
+		if err == nil {
+			return obf
+		}
+	}
+	return nil
+}
+
+// startNetworkWatcher continuously checks default gateway/DNS reachability.
+// When internet recovers from offline to online, it broadcasts on netWakeupCh
+// to immediately wake up sleeping channel reconnect loops.
+func (tm *TunnelManager) startNetworkWatcher(ctx context.Context) {
+	tm.netUp.Store(true)
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				reachable := tm.probeNetwork()
+				wasUp := tm.netUp.Swap(reachable)
+
+				if !wasUp && reachable {
+					mainLog.Info("⚡ [NetWatcher] Internet restored! Triggering immediate channel reconnection")
+					tm.broadcastNetWakeup()
+				} else if wasUp && !reachable {
+					mainLog.Warn("🌐 [NetWatcher] Internet connectivity lost — primary internet is down")
+				}
+			}
+		}
+	}()
+}
+
+func (tm *TunnelManager) broadcastNetWakeup() {
+	tm.mu.Lock()
+	ch := tm.netWakeupCh
+	tm.netWakeupCh = make(chan struct{})
+	tm.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+func (tm *TunnelManager) NetWakeup() <-chan struct{} {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return tm.netWakeupCh
+}
+
+func (tm *TunnelManager) isNetworkUp() bool {
+	return tm.netUp.Load()
+}
+
+// probeNetwork tests if raw internet or domestic gateway connectivity exists.
+func (tm *TunnelManager) probeNetwork() bool {
+	probes := []string{
+		"1.1.1.1:53",
+		"8.8.8.8:53",
+		"185.161.112.33:53", // domestic Iran DNS
+	}
+	for _, target := range probes {
+		d := net.Dialer{Timeout: 1200 * time.Millisecond}
+		conn, err := d.Dial("tcp", target)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	var r net.Resolver
+	addrs, err := r.LookupHost(ctx, "web.bale.ai")
+	return err == nil && len(addrs) > 0
+}
+
+// routingSettingKeys are the DB setting keys for the application-level DNS and
+// split-tunneling bypass configuration.
+const (
+	settingDNSPrimary    = "dns_primary"
+	settingDNSSecondary  = "dns_secondary"
+	settingBypassDomains = "bypass_domains"
+)
+
+// initRoutingEngine loads the application-level DNS and bypass-domain settings
+// from the database (falling back to config/env defaults), builds the
+// RoutingEngine, and installs the custom DNS into the Bale and LiveKit
+// packages so all Bale infrastructure connections resolve through the
+// admin-configured upstream DNS roots.
+func initRoutingEngine(cfg *config.Config, database *db.Database) *RoutingEngine {
+	primary := cfg.DNSPrimary
+	secondary := cfg.DNSSecondary
+	bypassDomains := cfg.BypassDomains
+
+	// Override with persisted DB settings if present (admin dashboard values).
+	if v, err := database.GetSetting(settingDNSPrimary); err == nil && v != "" {
+		primary = v
+	}
+	if v, err := database.GetSetting(settingDNSSecondary); err == nil && v != "" {
+		secondary = v
+	}
+	if v, err := database.GetSetting(settingBypassDomains); err == nil && v != "" {
+		bypassDomains = v
+	}
+
+	re := NewRoutingEngine(primary, secondary, bypassDomains)
+	re.InstallAppDNS()
+	mainLog.Info("Routing engine ready: DNS=%s/%s bypass-domains=%d entries",
+		primary, secondary, len(strings.Split(bypassDomains, ",")))
+	return re
 }
 
 // getOrCreateClientID generates or loads a persistent client ID.
@@ -313,6 +483,57 @@ func (tm *TunnelManager) IsActive() bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	return tm.active
+}
+
+// ReloadRouting hot-swaps the application DNS targets and bypass-domain list
+// from the admin dashboard.  Persists the new values to the database, rebuilds
+// the routing engine's resolver and bypass trie, and re-installs the updated
+// DNS into the Bale/LiveKit packages so new connections use the new roots
+// instantly — no tunnel restart required.
+func (tm *TunnelManager) ReloadRouting(primary, secondary, bypassDomains string) error {
+	// Persist to database.
+	if err := tm.database.SetSetting(settingDNSPrimary, primary); err != nil {
+		return fmt.Errorf("persist dns_primary: %w", err)
+	}
+	if err := tm.database.SetSetting(settingDNSSecondary, secondary); err != nil {
+		return fmt.Errorf("persist dns_secondary: %w", err)
+	}
+	if err := tm.database.SetSetting(settingBypassDomains, bypassDomains); err != nil {
+		return fmt.Errorf("persist bypass_domains: %w", err)
+	}
+
+	// Rebuild and re-install.
+	tm.mu.Lock()
+	re := tm.routing
+	tm.mu.Unlock()
+	if re == nil {
+		re = NewRoutingEngine(primary, secondary, bypassDomains)
+		tm.mu.Lock()
+		tm.routing = re
+		tm.mu.Unlock()
+	} else {
+		re.Reload(primary, secondary, bypassDomains)
+	}
+	re.InstallAppDNS()
+	mainLog.Info("[Manager] Routing reloaded: DNS=%s/%s bypass-domains=%d",
+		primary, secondary, len(strings.Split(bypassDomains, ",")))
+	return nil
+}
+
+// GetRoutingSettings returns the current application DNS and bypass-domain
+// configuration for the admin API.
+func (tm *TunnelManager) GetRoutingSettings() (primary, secondary, bypassDomains string) {
+	tm.mu.Lock()
+	re := tm.routing
+	tm.mu.Unlock()
+	if re == nil {
+		// Fall back to DB-persisted values.
+		primary, _ = tm.database.GetSetting(settingDNSPrimary)
+		secondary, _ = tm.database.GetSetting(settingDNSSecondary)
+		bypassDomains, _ = tm.database.GetSetting(settingBypassDomains)
+		return
+	}
+	return re.Snapshot()
 }
 
 // GetDetailedStatus returns the full tunnel status with per-channel details.
@@ -356,11 +577,20 @@ func (tm *TunnelManager) GetDetailedStatus() TunnelStatus {
 		}
 	}
 
+	// Collect artery telemetry if pool is active
+	var arteryStatuses []artery.ArteryStatus
+	tm.mu.Lock()
+	if tm.pool != nil {
+		arteryStatuses = tm.pool.GetArteryStatuses()
+	}
+	tm.mu.Unlock()
+
 	status := TunnelStatus{
 		Active:         active,
 		Phase:          overallPhase,
 		ClientID:       tm.clientID,
 		Channels:       channels,
+		Arteries:       arteryStatuses,
 		TotalChannels:  pairCount,
 		ActiveCount:    activeCount,
 		TotalSent:      totalSent,
@@ -434,6 +664,10 @@ func (tm *TunnelManager) Stop() {
 		tm.cancel()
 		tm.cancel = nil
 	}
+	if tm.orchestrator != nil {
+		tm.orchestrator.Stop()
+		tm.orchestrator = nil
+	}
 	if tm.pool != nil {
 		tm.pool.CloseAll()
 		tm.pool = nil
@@ -449,23 +683,25 @@ func (tm *TunnelManager) Stop() {
 	mainLog.Info("[Manager] Tunnel stopped.")
 }
 
+// StopAndEndCalls unifies disconnecting the local tunnel and ending all calls on the server.
+// It stops local proxy and routing, closes channel sessions, and invokes ForceEndCall()
+// which sends BLETUN:ENDCALL to all paired server accounts and waits for explicit ACKs.
+func (tm *TunnelManager) StopAndEndCalls() (map[string]interface{}, error) {
+	mainLog.Info("[Manager] Disconnecting tunnel and ending all calls on server...")
+	tm.Stop()
+	time.Sleep(600 * time.Millisecond)
+	return tm.ForceEndCall()
+}
+
 // ForceEndCall sends BLETUN:ENDCALL to all paired server accounts via Bale,
 // waits for BLETUN:ENDCALL_ACK from each, then cleans up messages.
 // This forces the server to end any active call and become ready for new calls.
 // Works even when the tunnel is not active (e.g. after a sudden disconnect).
 func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 	// Load pairings from database
-	pairings, err := tm.database.ListActivePairingsByOwner(tm.clientID)
+	pairings, err := tm.database.ListActivePairings()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load pairings: %w", err)
-	}
-
-	// Fallback: if no owner pairings, try all active pairings
-	if len(pairings) == 0 {
-		pairings, err = tm.database.ListActivePairings()
-		if err != nil {
-			return nil, fmt.Errorf("failed to load pairings: %w", err)
-		}
 	}
 
 	if len(pairings) == 0 {
@@ -485,7 +721,7 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 		}
 
 		wg.Add(1)
-		go func(clientToken string, serverBaleID int64, pairingID uint) {
+		go func(clientToken string, clientBaleID, serverBaleID int64, pairingID uint) {
 			defer wg.Done()
 
 			result := map[string]interface{}{
@@ -512,9 +748,13 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 			client.StartPingLoop()
 			time.Sleep(1 * time.Second)
 
-			// Send ENDCALL command
+			// Send ENDCALL command with client Bale user ID
 			mainLog.Info("%s Sending ENDCALL to %d...", label, serverBaleID)
-			if err := client.SendTextMessage(serverBaleID, "BLETUN:ENDCALL"); err != nil {
+			endMsg := "BLETUN:ENDCALL"
+			if clientBaleID > 0 {
+				endMsg = fmt.Sprintf("BLETUN:ENDCALL:%d", clientBaleID)
+			}
+			if err := client.SendTextMessage(serverBaleID, endMsg); err != nil {
 				mainLog.Error("%s Failed to send ENDCALL: %v", label, err)
 				result["status"] = "send_failed"
 				result["error"] = err.Error()
@@ -532,7 +772,7 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 			for !ackReceived {
 				select {
 				case msg := <-client.TextMsgCh:
-					if msg == "BLETUN:ENDCALL_ACK" {
+					if msg == "BLETUN:ENDCALL_ACK" || strings.HasPrefix(msg, "BLETUN:ENDCALL_ACK") {
 						mainLog.Info("%s ✅ ACK received!", label)
 						ackReceived = true
 					} else {
@@ -545,7 +785,6 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 					mu.Lock()
 					results = append(results, result)
 					mu.Unlock()
-					// Still clean up messages
 					client.CleanupMessages()
 					return
 				}
@@ -563,7 +802,7 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 			mu.Lock()
 			results = append(results, result)
 			mu.Unlock()
-		}(p.ClientAccount.Token, p.ServerAccount.BaleUserID, p.ID)
+		}(p.ClientAccount.Token, p.ClientAccount.BaleUserID, p.ServerAccount.BaleUserID, p.ID)
 	}
 
 	wg.Wait()
@@ -583,24 +822,23 @@ func (tm *TunnelManager) ForceEndCall() (map[string]interface{}, error) {
 	}, nil
 }
 
-// loadPairsFromDB loads active pairings from the database scoped to this
-// client's owner ID, converts them to TokenPair format for initChannel.
+// loadPairsFromDB loads active pairings from the database, converts them to TokenPair format for initChannel.
 // If no pairings exist, it attempts auto-pairing first.
 func (tm *TunnelManager) loadPairsFromDB() ([]config.TokenPair, string, error) {
-	// First, check for active pairings belonging to this client
-	pairings, err := tm.database.ListActivePairingsByOwner(tm.clientID)
+	// Check for active pairings
+	pairings, err := tm.database.ListActivePairings()
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to load pairings: %w", err)
 	}
 
 	mode := "pairing"
 
-	// If no pairings for this owner, attempt auto-pairing (smart mode)
+	// If no pairings, attempt auto-pairing (smart mode)
 	if len(pairings) == 0 {
-		count, _ := tm.manager.AutoPairUnmatched(tm.clientID)
+		count, _ := tm.manager.AutoPairUnmatched("")
 		if count > 0 {
-			mainLog.Info("[Manager] Smart-paired %d accounts for client %s", count, tm.clientID)
-			pairings, _ = tm.database.ListActivePairingsByOwner(tm.clientID)
+			mainLog.Info("[Manager] Smart-paired %d accounts", count)
+			pairings, _ = tm.database.ListActivePairings()
 			mode = "smart"
 		}
 	}
@@ -617,13 +855,14 @@ func (tm *TunnelManager) loadPairsFromDB() ([]config.TokenPair, string, error) {
 			continue
 		}
 		pairs = append(pairs, config.TokenPair{
-			Index:        i + 1,
-			ClientToken:  p.ClientAccount.Token,
-			TargetUserID: p.ServerAccount.BaleUserID,
+			Index:            i + 1,
+			ClientToken:      p.ClientAccount.Token,
+			TargetUserID:     p.ServerAccount.BaleUserID,
+			ExpectedCallerID: p.ClientAccount.BaleUserID,
 		})
-		mainLog.Info("[Manager] Pair %d: client=%d (Bale %d) → server=%d (Bale %d) [owner=%s]",
+		mainLog.Info("[Manager] Pair %d: client=%d (Bale %d) → server=%d (Bale %d)",
 			i+1, p.ClientAccountID, p.ClientAccount.BaleUserID,
-			p.ServerAccountID, p.ServerAccount.BaleUserID, tm.clientID)
+			p.ServerAccountID, p.ServerAccount.BaleUserID)
 	}
 
 	if len(pairs) == 0 {
@@ -639,7 +878,7 @@ func (tm *TunnelManager) loadPairsFromDB() ([]config.TokenPair, string, error) {
 		if serverCount == 0 {
 			return nil, "", fmt.Errorf("no SERVER accounts found — server accounts are synced from the remote server. Check sync status")
 		}
-		return nil, "", fmt.Errorf("no active pairings for this client (ID=%s) — go to the Pairings page and create pairings or use Auto-Pair", tm.clientID)
+		return nil, "", fmt.Errorf("no active pairings found — go to the Pairings page and create pairings or use Auto-Pair")
 	}
 
 	return pairs, mode, nil
@@ -696,12 +935,50 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 	var channels []*channelState
 	var mu sync.Mutex
 	var proxyOnce sync.Once
+	var orchOnce sync.Once
 
-	// === SEQUENTIAL CONNECTION — MULTI-QUIC MODE ===
-	// Connect channels sequentially. Each channel fully establishes WebRTC
-	// signaling and dials its own independent QUIC connection before the next
-	// one starts. This avoids concurrent ICE/DTLS negotiations that trigger
-	// gateway/TURN rate limits or drops.
+	// Start proactive network reachability monitor
+	tm.startNetworkWatcher(ctx)
+
+	// Ensure SOCKS5 & HTTP proxies are listening immediately on startup so local applications
+	// can bind and route traffic as soon as any artery connects.
+	proxyOnce.Do(func() {
+		go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool, tm.routing)
+		go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool, tm.routing)
+		mainLog.Info(" 🚀 SOCKS5 (:10909) and HTTP (:9095) proxies listening — awaiting active arteries")
+		for _, ip := range getLocalIPs() {
+			mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
+		}
+	})
+
+	// Background health monitor + stats: runs continuously as channels join
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				for _, ch := range channels {
+					stats := ch.sfu.GetStats()
+					var sent, recv int64
+					if s, ok := stats["bytes_sent"].(int64); ok {
+						sent = s
+					}
+					if r, ok := stats["bytes_received"].(int64); ok {
+						recv = r
+					}
+					tm.updateChannelStats(ch.index-1, sent, recv)
+					tm.updateChannelHealth(ch.index-1, ch.sfu)
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	// === SEQUENTIAL INITIAL CONNECTION WITH PERSISTENT BACKGROUND RECOVERY ===
 	for i, pair := range pairs {
 		select {
 		case <-ctx.Done():
@@ -714,23 +991,34 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		mainLog.Info("[%s] 🔗 Connecting pair %d/%d (multi-QUIC mode)...", label, i+1, len(pairs))
 
 		ch, qconn := tm.initChannelWithRetry(ctx, i, pair, label)
-		if ch == nil {
-			mainLog.Warn("[%s] ❌ Channel init failed (skipping)", label)
-			continue
+		if ch != nil && qconn != nil {
+			tunnelPool.RegisterWithIndex(label, qconn, i)
+			mainLog.Info("[%s] ✅ Independent QUIC connection registered as artery (pool size: %d)", label, tunnelPool.ActiveCount())
+			tm.setChannelPhase(i, PhaseTunnelActive, "")
+			mu.Lock()
+			channels = append(channels, ch)
+			mu.Unlock()
+
+			// Start Artery Orchestrator as soon as the first connection is live
+			orchOnce.Do(func() {
+				orch := tm.startArteryOrchestrator(ctx, tunnelPool, &channels, &mu, pairs)
+				tm.mu.Lock()
+				tm.orchestrator = orch
+				tm.mu.Unlock()
+				mainLog.Info(" 🧠 Artery orchestrator active — autonomous health & load-balancing engaged")
+			})
+		} else {
+			mainLog.Warn("[%s] ⚠️ Initial connect unsuccessful — background continuous recovery engaged", label)
+			tm.setChannelPhase(i, PhaseDisconnected, "initial connection pending")
 		}
 
-		// Register this lane's independent QUIC connection into the pool.
-		if qconn != nil {
-			tunnelPool.Register(label, qconn)
-			mainLog.Info("[%s] ✅ Independent QUIC connection registered (pool size: %d)", label, tunnelPool.ActiveCount())
-		}
-
-		tm.setChannelPhase(i, PhaseTunnelActive, "")
-		mu.Lock()
-		channels = append(channels, ch)
-		mu.Unlock()
-
+		// Launch persistent monitor and recovery loop for EVERY channel
 		go tm.monitorAndReconnect(ctx, tunnelPool, ch, qconn, i, pair, label, &mu, &channels, &proxyOnce)
+
+		if tunnelPool.ActiveCount() > 1 {
+			mainLog.Info(" ⚡ [Load Balancer] Added %s to pool — balancing traffic across %d/%d active arteries",
+				label, tunnelPool.ActiveCount(), len(pairs))
+		}
 	}
 
 	if ctx.Err() != nil {
@@ -739,27 +1027,13 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 
 	active := tunnelPool.ActiveCount()
 	if active == 0 {
-		mainLog.Info("[Main] ❌ No channels established! Cannot start proxy.")
-		tm.mu.Lock()
-		tm.lastError = "all channels failed to connect"
-		tm.mu.Unlock()
-		tm.Stop()
-		return
+		mainLog.Warn(" ⚠️ [Main] 0/%d channels currently active — persistent background recovery active", len(pairs))
+	} else {
+		mainLog.Info(" 🟢 %d/%d channels active in pool", active, len(pairs))
 	}
-	mainLog.Info(" 🟢 %d/%d channels active — READY", active, len(pairs))
 
-	// Start SOCKS5 / HTTP proxies once at least one QUIC connection is live.
-	proxyOnce.Do(func() {
-		go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
-		go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
-		mainLog.Info(" ✅ Proxies started!")
-		for _, ip := range getLocalIPs() {
-			mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
-		}
-	})
-
-	// Health monitor + stats (lightweight sampling, doesn't affect VPN throughput)
-	ticker := time.NewTicker(3 * time.Second)
+	// Liveness monitor: wait until ctx is cancelled by explicit user action
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -773,9 +1047,14 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 			mu.Unlock()
 
 			for _, ch := range chs {
+				endMsg := "BLETUN:ENDCALL"
+				if ch.pair.ExpectedCallerID > 0 {
+					endMsg = fmt.Sprintf("BLETUN:ENDCALL:%d", ch.pair.ExpectedCallerID)
+				}
+				ch.client.SendTextMessage(ch.cfg.BaleTargetUserID, endMsg)
 				ch.client.SendTextMessage(ch.cfg.BaleTargetUserID, "BLETUN:END")
 			}
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 			for _, ch := range chs {
 				ch.client.CleanupMessages()
 				ch.sfu.Close()
@@ -785,30 +1064,11 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 			return
 
 		case <-ticker.C:
+			// Continuous status check — NEVER stop automatically
 			act := tunnelPool.ActiveCount()
 			if act == 0 {
-				mainLog.Info("[Health] ❌ All channels dead!")
-				tm.mu.Lock()
-				tm.lastError = "all channels disconnected"
-				tm.mu.Unlock()
-				tm.Stop()
-				return
+				// Channels recovering in background
 			}
-			// Update per-channel stats and health (lightweight — just read counters)
-			mu.Lock()
-			for _, ch := range channels {
-				stats := ch.sfu.GetStats()
-				var sent, recv int64
-				if s, ok := stats["bytes_sent"].(int64); ok {
-					sent = s
-				}
-				if r, ok := stats["bytes_received"].(int64); ok {
-					recv = r
-				}
-				tm.updateChannelStats(ch.index-1, sent, recv)
-				tm.updateChannelHealth(ch.index-1, ch.sfu)
-			}
-			mu.Unlock()
 		}
 	}
 }
@@ -837,22 +1097,20 @@ func (tm *TunnelManager) monitorAndReconnect(
 	channels *[]*channelState,
 	proxyOnce *sync.Once,
 ) {
-	backoff := 3 * time.Second
-	const maxBackoff = 30 * time.Second
-
 	currentQConn := qconn
 	currentCh := ch
+	consecutiveFails := 0
 
 	// Layer 3: per-channel randomized refresh deadline.
 	refreshAt := time.Now().Add(tm.nextRefreshInterval())
 	mainLog.Info("[%s] 🔄 Next scheduled refresh in %v", label, time.Until(refreshAt).Round(time.Second))
 
 	for {
-		// ── Liveness check every 3s ───────────────────────────────────────
+		// ── Liveness check every 2s ───────────────────────────────────────
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(3 * time.Second):
+		case <-time.After(2 * time.Second):
 		}
 
 		// ── Layer 3: Staggered Refresh ────────────────────────────────────
@@ -867,30 +1125,10 @@ func (tm *TunnelManager) monitorAndReconnect(
 				tm.refresh.release()
 
 				if currentCh != nil && currentQConn != nil {
-					backoff = 3 * time.Second
-					proxyOnce.Do(func() {
-						go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
-						go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
-					})
+					consecutiveFails = 0
 					refreshAt = time.Now().Add(tm.nextRefreshInterval())
 					mainLog.Info("[%s] 🔄 Next scheduled refresh in %v", label, time.Until(refreshAt).Round(time.Second))
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(2 * time.Second):
-					}
 					continue
-				}
-				// Refresh failed. Check if fatal.
-				tm.channelMu.RLock()
-				var curPhase ChannelPhase
-				if idx < len(tm.channelStatus) {
-					curPhase = tm.channelStatus[idx].Phase
-				}
-				tm.channelMu.RUnlock()
-				if curPhase == PhaseError {
-					mainLog.Error("[%s] ❌ Refresh hit PhaseError — terminating monitor goroutine", label)
-					return
 				}
 				refreshAt = time.Now().Add(time.Duration(2+rand.Intn(4)) * time.Minute)
 			} else {
@@ -905,38 +1143,25 @@ func (tm *TunnelManager) monitorAndReconnect(
 		dead := false
 		reason := ""
 
-		if currentCh == nil && currentQConn == nil {
-			tm.channelMu.RLock()
-			var curPhase ChannelPhase
-			if idx < len(tm.channelStatus) {
-				curPhase = tm.channelStatus[idx].Phase
-			}
-			tm.channelMu.RUnlock()
-			if curPhase == PhaseError {
-				mainLog.Error("[%s] ❌ PhaseError with nil channel — terminating monitor goroutine", label)
-				return
-			}
-			mainLog.Warn("[%s] ⚠️  Ghost state detected (nil pointers, phase=%s) — forcing reconnect", label, curPhase)
+		if currentCh == nil || currentQConn == nil {
 			dead = true
-			reason = "ghost nil pointers"
-		}
-
-		// Check 1: QUIC connection context
-		if currentQConn != nil {
+			reason = "channel offline"
+		} else {
+			// Check 1: QUIC connection context
 			select {
 			case <-currentQConn.Context().Done():
 				dead = true
 				reason = "QUIC context cancelled"
 			default:
 			}
-		}
 
-		// Check 2: WebRTC ICE state
-		if !dead && currentCh != nil && currentCh.sfu != nil {
-			health := currentCh.sfu.GetHealth()
-			if health.PubICEState == "disconnected" || health.PubICEState == "failed" {
-				dead = true
-				reason = "WebRTC ICE " + health.PubICEState
+			// Check 2: WebRTC ICE state
+			if !dead && currentCh.sfu != nil {
+				health := currentCh.sfu.GetHealth()
+				if health.PubICEState == "disconnected" || health.PubICEState == "failed" {
+					dead = true
+					reason = "WebRTC ICE " + health.PubICEState
+				}
 			}
 		}
 
@@ -944,31 +1169,66 @@ func (tm *TunnelManager) monitorAndReconnect(
 			continue
 		}
 
-		// ── Layer 2: death reconnect (with Clean Hangup Protocol) ─────────
-		mainLog.Warn("[%s] 💀 Channel dead (%s) — reconnecting (backoff: %.0fs)", label, reason, backoff.Seconds())
+		// ── Layer 2: Death / Disconnect Reconnect ─────────────────────────
+		consecutiveFails++
+		var sleepDur time.Duration
+		if consecutiveFails <= 4 {
+			// Tier 1: Fast recovery for transient micro-drops (1s, 2s, 4s, 8s)
+			sleepDur = time.Duration(1<<uint(consecutiveFails-1)) * time.Second
+		} else {
+			// Tier 2: Sustained low-overhead cadence for prolonged outages (15s, 30s, 60s, max 90s)
+			switch consecutiveFails {
+			case 5:
+				sleepDur = 15 * time.Second
+			case 6:
+				sleepDur = 30 * time.Second
+			case 7:
+				sleepDur = 60 * time.Second
+			default:
+				sleepDur = 90 * time.Second
+			}
+		}
+		// Apply ±20% randomized jitter
+		jitter := time.Duration((rand.Float64()*0.4 - 0.2) * float64(sleepDur))
+		actualSleep := sleepDur + jitter
+		if actualSleep < 1*time.Second {
+			actualSleep = 1 * time.Second
+		}
+
+		mainLog.Warn("[%s] 💀 Channel offline (%s, attempt #%d) — reconnecting in %.1fs",
+			label, reason, consecutiveFails, actualSleep.Seconds())
 		tm.setChannelPhase(idx, PhaseDisconnected, reason)
+
+		// Wait for sleep interval OR instant network recovery signal
+		if !tm.isNetworkUp() {
+			mainLog.Warn("[%s] 🌐 Primary internet appears down — waiting for network recovery", label)
+			select {
+			case <-ctx.Done():
+				return
+			case <-tm.NetWakeup():
+				mainLog.Info("[%s] ⚡ Internet restored! Immediate reconnection attempt...", label)
+			case <-time.After(30 * time.Second):
+			}
+		} else {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tm.NetWakeup():
+				mainLog.Info("[%s] ⚡ Network recovery signal received — immediate reconnect attempt", label)
+			case <-time.After(actualSleep):
+			}
+		}
 
 		tm.refreshChannel(ctx, tunnelPool, &currentCh, &currentQConn, idx, tp, label, mu, channels)
 
 		if currentCh == nil || currentQConn == nil {
-			mainLog.Warn("[%s] ❌ Reconnect failed — retrying in %.0fs", label, backoff.Seconds())
-			backoff = min(backoff*2, maxBackoff)
+			mainLog.Warn("[%s] ❌ Reconnect attempt #%d failed — persistent recovery will retry", label, consecutiveFails)
 			continue
 		}
 
-		mainLog.Info("[%s] ✅ Reconnected!", label)
-		backoff = 3 * time.Second
-
-		proxyOnce.Do(func() {
-			go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
-			go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
-		})
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(2 * time.Second):
-		}
+		mainLog.Info("[%s] ✅ Reconnected successfully! (recovered after %d attempts)", label, consecutiveFails)
+		consecutiveFails = 0
+		refreshAt = time.Now().Add(tm.nextRefreshInterval())
 	}
 }
 
@@ -1034,7 +1294,7 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 
 	tm.setChannelPhase(idx, PhaseSFUConnect, "")
 	mainLog.Info("[%s] Connecting to SFU...", label)
-	sfu := lk.NewSFUTransport(&chanCfg, tm.obfuscator)
+	sfu := lk.NewSFUTransport(&chanCfg, tm.getObfuscator())
 	if err := sfu.Connect(ctx); err != nil {
 		errStr := "SFU connection failed: " + err.Error()
 		tm.setChannelPhase(idx, PhaseError, errStr)
@@ -1074,21 +1334,20 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	opusPC := quicconn.NewClient(rtpConn)
 
 	// QUIC config: each connection is independent — no bond header overhead.
-	initPktSize := uint16(1140)
-	if tm.obfuscator != nil && tm.obfuscator.Enabled() {
-		initPktSize = 1100
-	}
+	// MTU CLAMPING: 1060 bytes (QUIC) + 40 bytes (XChaCha20 envelope) +
+	// 33 bytes (Opus TOC + max VBR padding) = 1133 bytes wire footprint.
+	// This safely passes through all SFU UDP MTU limiters (1200 byte cap).
 	quicCfg := &quic.Config{
-		InitialPacketSize:              initPktSize,
+		InitialPacketSize:              1060,
 		MaxIdleTimeout:                 45 * time.Second,
 		HandshakeIdleTimeout:           20 * time.Second,
 		KeepAlivePeriod:                10 * time.Second,
 		MaxIncomingStreams:             10000,
 		MaxIncomingUniStreams:          10000,
-		InitialStreamReceiveWindow:     4 * 1024 * 1024,
-		MaxStreamReceiveWindow:         32 * 1024 * 1024,
-		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
-		MaxConnectionReceiveWindow:     64 * 1024 * 1024,
+		InitialStreamReceiveWindow:     8 * 1024 * 1024,
+		MaxStreamReceiveWindow:         64 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     128 * 1024 * 1024,
 		DisablePathMTUDiscovery:        true,
 	}
 
@@ -1188,7 +1447,7 @@ func getLocalIPs() []string {
 
 // ===================== SOCKS5 Proxy =====================
 
-func startSOCKS5(ctx context.Context, addr string, p *pool.TunnelPool) {
+func startSOCKS5(ctx context.Context, addr string, p *pool.TunnelPool, re *RoutingEngine) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		mainLog.Fatal("[SOCKS5] Listen error: %v", err)
@@ -1209,13 +1468,18 @@ func startSOCKS5(ctx context.Context, addr string, p *pool.TunnelPool) {
 			}
 			continue
 		}
-		go handleSOCKS5(conn, p)
+		// TCP_NODELAY: disable Nagle's algorithm to eliminate 40ms delay
+		// on small SOCKS5 handshake packets. Critical for perceived latency.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+		}
+		go handleSOCKS5(conn, p, re)
 	}
 }
 
-func handleSOCKS5(conn net.Conn, p *pool.TunnelPool) {
+func handleSOCKS5(conn net.Conn, p *pool.TunnelPool, re *RoutingEngine) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	// 1. Greeting
 	buf := make([]byte, 258)
@@ -1267,12 +1531,17 @@ func handleSOCKS5(conn net.Conn, p *pool.TunnelPool) {
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	conn.SetDeadline(time.Time{})
 
-	dialAndRelay(p, targetAddr, conn)
+	// Classify and route: bypass (direct local) or tunnel (QUIC pool).
+	if re != nil {
+		re.classifyAndRelay(targetAddr, conn, p)
+	} else {
+		dialAndRelay(p, targetAddr, conn)
+	}
 }
 
 // ===================== HTTP CONNECT Proxy =====================
 
-func startHTTPProxy(ctx context.Context, addr string, p *pool.TunnelPool) {
+func startHTTPProxy(ctx context.Context, addr string, p *pool.TunnelPool, re *RoutingEngine) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		mainLog.Fatal("[HTTP] Listen error: %v", err)
@@ -1293,13 +1562,17 @@ func startHTTPProxy(ctx context.Context, addr string, p *pool.TunnelPool) {
 			}
 			continue
 		}
-		go handleHTTPProxy(conn, p)
+		// TCP_NODELAY: disable Nagle's algorithm for HTTP proxy connections.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+		}
+		go handleHTTPProxy(conn, p, re)
 	}
 }
 
-func handleHTTPProxy(conn net.Conn, p *pool.TunnelPool) {
+func handleHTTPProxy(conn net.Conn, p *pool.TunnelPool, re *RoutingEngine) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadString('\n')
@@ -1330,14 +1603,18 @@ func handleHTTPProxy(conn net.Conn, p *pool.TunnelPool) {
 	headersStr := headersBuilder.String()
 
 	if method == "CONNECT" {
-		// HTTPS tunnel
+		// HTTPS tunnel — classify before relaying.
 		conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 		conn.SetDeadline(time.Time{})
-		dialAndRelay(p, target, conn)
+		if re != nil {
+			re.classifyAndRelay(target, conn, p)
+		} else {
+			dialAndRelay(p, target, conn)
+		}
 		return
 	}
 
-	// Plain HTTP — forward through tunnel
+	// Plain HTTP — forward through tunnel or direct local (bypass).
 	host := target
 	path := target
 	if strings.HasPrefix(target, "http://") {
@@ -1356,45 +1633,27 @@ func handleHTTPProxy(conn net.Conn, p *pool.TunnelPool) {
 	reqLine := fmt.Sprintf("%s %s %s\r\n%s", method, path, parts[2], headersStr)
 	conn.SetDeadline(time.Time{})
 
-	// Open stream from pool
-	stream, err := p.OpenStream()
-	if err != nil {
-		io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
-		return
+	if re != nil {
+		re.classifyHTTPPlain(host, reqLine, conn, p)
+	} else {
+		httpTunnelRelay(p, host, reqLine, conn)
 	}
-	defer stream.Close()
-
-	// Send target address as length-prefixed header
-	addrBytes := []byte(host)
-	hdr := make([]byte, 2+len(addrBytes))
-	binary.BigEndian.PutUint16(hdr[:2], uint16(len(addrBytes)))
-	copy(hdr[2:], addrBytes)
-	if _, err := stream.Write(hdr); err != nil {
-		io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
-		return
-	}
-
-	// Send the HTTP request
-	stream.Write([]byte(reqLine))
-
-	// Bidirectional relay using 256KB buffers
-	done := make(chan struct{}, 2)
-	go func() {
-		buf := make([]byte, 256*1024)
-		io.CopyBuffer(stream, conn, buf)
-		done <- struct{}{}
-	}()
-	go func() {
-		buf := make([]byte, 256*1024)
-		io.CopyBuffer(conn, stream, buf)
-		done <- struct{}{}
-	}()
-	<-done
 }
 
 // ===================== Common Relay =====================
 
-// dialAndRelay opens a stream from the pool, sends the target address, then relays data.
+// dialAndRelay opens a stream from the pool via ECF scheduling, sends the
+// target address, then relays data bidirectionally.
+//
+// BANDWIDTH BONDING STRATEGY:
+// Each new TCP connection (SOCKS5/HTTP) is independently ECF-routed to the
+// artery with the lowest expected completion time.  Modern browsers open 6+
+// concurrent connections per domain, so large downloads naturally spread
+// across all available arteries without requiring sub-stream chunking.
+//
+// Within a single TCP session, data stays on one QUIC stream (preserving
+// TCP ordering semantics).  QUIC's own congestion control manages flow
+// on that artery while the ECF scheduler keeps new sessions balanced.
 func dialAndRelay(p *pool.TunnelPool, addr string, localConn net.Conn) {
 	stream, err := p.OpenStream()
 	if err != nil {
@@ -1413,15 +1672,17 @@ func dialAndRelay(p *pool.TunnelPool, addr string, localConn net.Conn) {
 		return
 	}
 
-	// Bidirectional relay using 256KB buffers (reduces syscall overhead over TURN relay)
+	// Bidirectional relay using 32KB buffers.
+	// Smaller buffers improve latency and reduce memory pressure vs 256KB.
+	// QUIC's own flow control and congestion window manage throughput.
 	done := make(chan struct{}, 2)
 	go func() {
-		buf := make([]byte, 256*1024)
+		buf := make([]byte, 32*1024)
 		io.CopyBuffer(stream, localConn, buf)
 		done <- struct{}{}
 	}()
 	go func() {
-		buf := make([]byte, 256*1024)
+		buf := make([]byte, 32*1024)
 		io.CopyBuffer(localConn, stream, buf)
 		done <- struct{}{}
 	}()
@@ -1523,7 +1784,7 @@ func detectRemoteServerURL() string {
 	}
 
 	// 3. Hardcoded fallback for known Clever Cloud deployment
-	const fallbackURL = "https://app-7c1a120b-18c6-43fd-850c-b2883b209c3d.cleverapps.io"
+	const fallbackURL = "https://app-eb142ec2-97df-4403-bd0a-723fbbc767f9.cleverapps.io"
 	return fallbackURL
 }
 

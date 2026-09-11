@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -43,9 +44,10 @@ func getDataVersion() int64 {
 
 // SyncSnapshot represents the full state of accounts and pairings for sync.
 type SyncSnapshot struct {
-	Version  int64        `json:"version"`
-	Accounts []db.Account `json:"accounts"`
-	Pairings []db.Pairing `json:"pairings"`
+	Version           int64        `json:"version"`
+	Accounts          []db.Account `json:"accounts"`
+	Pairings          []db.Pairing `json:"pairings"`
+	ObfuscationSecret string       `json:"obfuscation_secret,omitempty"`
 }
 
 // handleSyncSnapshot returns the current full state of accounts and pairings.
@@ -68,10 +70,18 @@ func (s *Server) handleSyncSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sec := os.Getenv("OBFUSCATION_SECRET")
+	if sec == "" {
+		if s, err := s.database.GetSetting("obfuscation_secret"); err == nil {
+			sec = s
+		}
+	}
+
 	writeJSON(w, http.StatusOK, SyncSnapshot{
-		Version:  getDataVersion(),
-		Accounts: accounts,
-		Pairings: pairings,
+		Version:           getDataVersion(),
+		Accounts:          accounts,
+		Pairings:          pairings,
+		ObfuscationSecret: sec,
 	})
 }
 

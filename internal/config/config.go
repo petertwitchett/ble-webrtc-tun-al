@@ -152,12 +152,12 @@ type Config struct {
 	Role string // "client" or "server"
 
 	// Bale signaling
-	BaleAccessToken   string
-	BaleTargetUserID  int64
+	BaleAccessToken  string
+	BaleTargetUserID int64
 
 	// LiveKit / Bale signaling
-	LiveKitWSURL      string
-	LiveKitToken      string
+	LiveKitWSURL string
+	LiveKitToken string
 
 	// ICE / TURN servers
 	TURNServerPrimary   string
@@ -178,14 +178,34 @@ type Config struct {
 
 	// Admin panel (server only)
 	AdminListenAddr string
-	AdminUsername    string
+	AdminUsername   string
 	AdminPassword   string
 
 	// Obfuscation (anti-DPI)
 	ObfuscationSecret string
 
+	// Number of Opus audio tracks for spatial multi-tracking camouflage.
+	// Data is striped round-robin across N tracks so each individual track
+	// maintains a low, voice-like bandwidth profile while the aggregate
+	// throughput scales.  Default 3.
+	NumTracks int
+
 	// Logging
 	LogLevel string
+
+	// Application-Level DNS Configuration (client-side).
+	// All domain resolution for Bale signaling/SFU connections and proxy
+	// split-routing decisions is performed through these upstream DNS roots,
+	// decoupled from the host OS resolver.  Defaults can be overridden at
+	// runtime from the admin dashboard (stored in the DB settings table).
+	DNSPrimary   string
+	DNSSecondary string
+
+	// Extensible Domain Bypass Mappings (client-side).
+	// A comma-separated list of domains whose traffic should bypass the
+	// WebRTC tunnel and route directly over the local network interface
+	// (e.g. domestic Iranian sites).  Bale's own domains are never bypassed.
+	BypassDomains string
 }
 
 // Load reads configuration from .env file and environment variables.
@@ -217,12 +237,18 @@ func Load() (*Config, error) {
 		SignalServerAddr: getEnv("SIGNAL_SERVER_ADDR", ""),
 
 		AdminListenAddr: getEnv("ADMIN_LISTEN_ADDR", ":8080"),
-		AdminUsername:    getEnv("ADMIN_USERNAME", "admin"),
-		AdminPassword:    getEnv("ADMIN_PASSWORD", "changeme"),
+		AdminUsername:   getEnv("ADMIN_USERNAME", "admin"),
+		AdminPassword:   getEnv("ADMIN_PASSWORD", "changeme"),
 
 		ObfuscationSecret: getEnv("OBFUSCATION_SECRET", ""),
 
+		NumTracks: getEnvInt("BLE_TUNNEL_TRACKS", 3),
+
 		LogLevel: getEnv("LOG_LEVEL", "info"),
+
+		DNSPrimary:    getEnv("BLE_DNS_PRIMARY", "1.1.1.1"),
+		DNSSecondary:  getEnv("BLE_DNS_SECONDARY", "1.0.0.1"),
+		BypassDomains: getEnv("BLE_BYPASS_DOMAINS", ""),
 	}
 
 	// Set defaults based on role

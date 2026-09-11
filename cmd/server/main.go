@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,10 +24,12 @@ import (
 	"github.com/salman/ble-webrtc-tun/internal/config"
 	"github.com/salman/ble-webrtc-tun/internal/db"
 	"github.com/salman/ble-webrtc-tun/internal/dcconn"
+	"github.com/salman/ble-webrtc-tun/internal/dns"
 	"github.com/salman/ble-webrtc-tun/internal/livekit"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
 	"github.com/salman/ble-webrtc-tun/internal/quicconn"
 	"github.com/salman/ble-webrtc-tun/internal/router"
+	"github.com/salman/ble-webrtc-tun/internal/s3sync"
 	"github.com/salman/ble-webrtc-tun/internal/transport"
 )
 
@@ -55,13 +58,6 @@ func main() {
 
 	os.Setenv("ROLE", "server")
 
-	// Fetch the live app_version (and API key) from Bale's JS bundle.
-	// Bale silently stops delivering push events (text messages, incoming calls)
-	// to clients whose app_version metadata is too old — even though the
-	// WebSocket connection stays open and pong frames keep arriving.
-	// This call updates the global before any bale.Client is created.
-	bale.FetchAndUpdateClientMeta()
-
 	cfg, err := config.Load()
 	if err != nil {
 		mainLog.Fatal("Failed to load config: %v", err)
@@ -75,11 +71,42 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Initialize S3 Persistence (Clever Cloud Cellar S3)
+	s3Cfg := s3sync.LoadConfig()
+	var s3Syncer *s3sync.Syncer
+	if s3Cfg.IsConfigured() {
+		mainLog.Info("☁️ Clever Cloud Cellar S3 persistence configured (bucket: %s, host: %s)", s3Cfg.Bucket, s3Cfg.Host)
+		s3Client := s3sync.NewClient(s3Cfg)
+		s3Syncer = s3sync.NewSyncer(s3Client, "data/server.db", func() error {
+			if serverDB != nil {
+				return serverDB.CheckpointWAL()
+			}
+			return nil
+		})
+
+		// Restore database from S3 before db.Init opens it
+		restoreCtx, restoreCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		restored, rErr := s3Syncer.Restore(restoreCtx)
+		restoreCancel()
+		if rErr != nil {
+			mainLog.Warn("☁️ S3 database restore warning: %v (continuing with local/fresh db)", rErr)
+		} else if restored {
+			mainLog.Info("☁️ Successfully restored server database from S3 bucket '%s'", s3Cfg.Bucket)
+		}
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
 		mainLog.Info("Shutting down...")
+		if s3Syncer != nil {
+			mainLog.Info("☁️ Flushing server database to S3 before exit...")
+			flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = s3Syncer.FlushSync(flushCtx)
+			flushCancel()
+			mainLog.Info("☁️ S3 database flush complete")
+		}
 		cancel()
 	}()
 
@@ -89,6 +116,55 @@ func main() {
 		mainLog.Fatal("Database init failed: %v", err)
 	}
 	defer serverDB.Close()
+
+	// Connect S3 syncer to database mutations
+	if s3Syncer != nil {
+		serverDB.OnMutation(func() {
+			s3Syncer.NotifyChange()
+		})
+		s3Syncer.Start(ctx)
+		// Perform an initial background sync after startup
+		go func() {
+			time.Sleep(3 * time.Second)
+			_ = s3Syncer.SyncNow(context.Background())
+		}()
+	}
+
+	// Initialize server-side Bale Dedicated Split-DNS resolver (for Bale WebSocket & WebRTC)
+	dnsPrimary, _ := serverDB.GetSetting("dns_primary")
+	dnsSecondary, _ := serverDB.GetSetting("dns_secondary")
+	serverResolver := dns.NewAppResolver(dnsPrimary, dnsSecondary)
+
+	installServerDNS := func() {
+		p, s := serverResolver.Servers()
+		if p == "" && s == "" {
+			bale.SetAppDialContext(nil)
+			livekit.SetAppDialContext(nil)
+			livekit.SetAppLookupIP(nil)
+			livekit.SetAppNet(nil)
+			mainLog.Info("🌐 Server Bale DNS: Using native host OS resolver (Clever Cloud default)")
+		} else {
+			bale.SetAppDialContext(serverResolver.DialContext)
+			livekit.SetAppDialContext(serverResolver.DialContext)
+			livekit.SetAppLookupIP(serverResolver.LookupIP)
+			pionNet, err := livekit.NewPionNet(serverResolver.LookupIP, serverResolver.DialContext)
+			if err == nil {
+				livekit.SetAppNet(pionNet)
+			}
+			mainLog.Info("⚡ Server Bale Dedicated Split-DNS ACTIVE: Primary=%s, Secondary=%s (Bale WS & WebRTC accelerated)", p, s)
+		}
+	}
+	installServerDNS()
+
+	// Load persisted Bale client-emulation constants from the database so they
+	// survive restarts, then refresh from the live Bale bundle.  Bale silently
+	// stops delivering push events (text messages, incoming calls) to clients
+	// whose app_version metadata is too old — even though the WebSocket stays
+	// open and pongs keep arriving — so we always fetch the latest before any
+	// bale.Client is created.
+	bale.LoadFromSettings(serverDB)
+	bale.FetchAndUpdateClientMeta()
+	bale.PersistToSettings(serverDB)
 
 	// Auto-migrate from .env.tokens if DB is empty
 	acctCount, _ := serverDB.CountAccounts("", "")
@@ -123,6 +199,51 @@ func main() {
 		Username: cfg.AdminUsername,
 		Password: cfg.AdminPassword,
 	})
+	apiSrv.S3Syncer = s3Syncer
+	apiSrv.OnForceEndCall = func() (map[string]interface{}, error) {
+		sessions := callRouter.GetAllSessions()
+		ended := 0
+		for _, s := range sessions {
+			callRouter.ForceEndCall(s.ServerAccountID)
+			ended++
+		}
+		if err := serverDB.ResetAllStatuses(); err != nil {
+			mainLog.Warn("Failed to reset statuses: %v", err)
+		}
+		adminPanel.AddLog("info", fmt.Sprintf("ForceEndCall: ended %d sessions, all accounts reset to IDLE", ended))
+		return map[string]interface{}{
+			"ended_sessions": ended,
+			"status":         "all accounts reset to IDLE",
+		}, nil
+	}
+
+	// Wire routing settings callbacks for Bale Dedicated Split-DNS
+	apiSrv.OnReloadRouting = func(primary, secondary, bypassDomains string) error {
+		if err := serverDB.SetSetting("dns_primary", primary); err != nil {
+			return err
+		}
+		if err := serverDB.SetSetting("dns_secondary", secondary); err != nil {
+			return err
+		}
+		serverResolver.SetServers(primary, secondary)
+		installServerDNS()
+		if primary == "" && secondary == "" {
+			adminPanel.AddLog("info", "Bale DNS: Reset to native host OS resolver")
+		} else {
+			adminPanel.AddLog("info", fmt.Sprintf("Bale Dedicated Split-DNS updated: %s / %s", primary, secondary))
+		}
+		return nil
+	}
+
+	apiSrv.GetRoutingSettings = func() (map[string]string, error) {
+		p, s := serverResolver.Servers()
+		return map[string]string{
+			"dns_primary":    p,
+			"dns_secondary":  s,
+			"bypass_domains": "",
+		}, nil
+	}
+
 	// Wire signaling forwarding from the new API server to the admin panel
 	apiSrv.SetAdminPanel(adminPanel)
 	go func() {
@@ -142,16 +263,9 @@ func main() {
 	}
 
 	// Obfuscation: XChaCha20-Poly1305 over RTP payloads.
-	// With QUIC (TLS 1.3) + WebRTC (DTLS/SRTP) the data is already triple-encrypted.
-	// Leave OBFUSCATION_SECRET empty for maximum speed — 40 bytes/pkt saved + less CPU.
-	if cfg.ObfuscationSecret != "" {
-		var err error
-		serverObf, err = dcconn.NewObfuscator(cfg.ObfuscationSecret)
-		if err != nil {
-			mainLog.Error("Failed to create obfuscator: %v (running without obfuscation)", err)
-		} else {
-			mainLog.Warn("⚠️  XChaCha20 obfuscation ENABLED — REDUNDANT with QUIC+SRTP. Costs 40 bytes/pkt + CPU. Unset OBFUSCATION_SECRET for max speed.")
-		}
+	serverObf = getServerObfuscator(cfg)
+	if serverObf != nil {
+		mainLog.Warn("⚠️  XChaCha20 obfuscation ENABLED — REDUNDANT with QUIC+SRTP. Costs 40 bytes/pkt + CPU. Unset OBFUSCATION_SECRET for max speed.")
 	} else {
 		mainLog.Info("✅ Obfuscation disabled — QUIC TLS 1.3 + DTLS/SRTP provides full encryption. Full MTU available.")
 	}
@@ -160,6 +274,28 @@ func main() {
 	// Hot-reload: will automatically detect new server accounts added via admin panel
 	adminPanel.AddLog("info", "Bale signaling mode enabled (hot-reload)")
 	runBaleSignaling(ctx, cfg, adminPanel, wrtc, useTUN)
+}
+
+// getServerObfuscator resolves the obfuscation secret from config, database settings, or environment.
+func getServerObfuscator(cfg *config.Config) *dcconn.Obfuscator {
+	secret := cfg.ObfuscationSecret
+	if secret == "" && serverDB != nil {
+		if s, err := serverDB.GetSetting("obfuscation_secret"); err == nil && s != "" {
+			secret = s
+		}
+	}
+	if secret == "" {
+		secret = os.Getenv("OBFUSCATION_SECRET")
+	}
+	if secret != "" {
+		obf, err := dcconn.NewObfuscator(secret)
+		if err != nil {
+			mainLog.Error("Failed to create obfuscator: %v (running without obfuscation)", err)
+			return nil
+		}
+		return obf
+	}
+	return nil
 }
 
 // runBaleSignaling connects to Bale WS, waits for calls, auto-accepts, and tunnels.
@@ -367,7 +503,6 @@ func runSingleAccountLoopDB(ctx context.Context, cfg *config.Config, adminPanel 
 	}
 }
 
-
 // activeCallIDs tracks calls being processed to prevent double-accept (legacy mode).
 var (
 	activeCallMu  sync.Mutex
@@ -513,6 +648,26 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 	callCh := client.GetCallCh()
 	sessionNum := 0
 
+	lookupCaller := func(rawMsg string) int64 {
+		if strings.HasPrefix(rawMsg, "BLETUN:ENDCALL:") {
+			parts := strings.Split(rawMsg, ":")
+			if len(parts) >= 3 {
+				if id, err := strconv.ParseInt(parts[2], 10, 64); err == nil && id > 0 {
+					return id
+				}
+			}
+		}
+		if sess := callRouter.GetSession(account.ID); sess != nil {
+			if cl, err := serverDB.GetAccount(sess.ClientAccountID); err == nil && cl != nil && cl.BaleUserID > 0 {
+				return cl.BaleUserID
+			}
+		}
+		if pairing, err := serverDB.GetPairingByServerAccount(account.ID); err == nil && pairing != nil && pairing.ClientAccount != nil && pairing.ClientAccount.BaleUserID > 0 {
+			return pairing.ClientAccount.BaleUserID
+		}
+		return expectedCallerID
+	}
+
 	for {
 		// Drain stale tunnel messages but preserve terminal messages
 		drainDone := false
@@ -521,18 +676,18 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 			case msg := <-client.TextMsgCh:
 				// Process terminal messages, drop stale tunnel messages
 				if strings.HasPrefix(msg, "BLECMD:") || strings.HasPrefix(msg, "BLERSZ:") || strings.HasPrefix(msg, "BLEEND:") {
-					// Terminal relay removed — commands now go via VPN proxy
 					continue
 				}
 				// Handle ENDCALL while draining — ACK immediately
-				if msg == "BLETUN:ENDCALL" && expectedCallerID != 0 {
-					mainLog.Info("%s Received ENDCALL while draining — sending ACK", label)
+				if strings.HasPrefix(msg, "BLETUN:ENDCALL") {
+					caller := lookupCaller(msg)
+					mainLog.Info("%s Received ENDCALL while draining — sending ACK to %d", label, caller)
 					adminPanel.AddLog("info", label+" 📴 ENDCALL received (idle) — sending ACK")
-					client.SendTextMessage(expectedCallerID, "BLETUN:ENDCALL_ACK")
-					// Also force-end in router + set IDLE (in case of stale state)
+					if caller != 0 {
+						client.SendTextMessage(caller, "BLETUN:ENDCALL_ACK")
+					}
 					callRouter.ForceEndCall(account.ID)
 					serverDB.SetAccountStatus(account.ID, db.StatusIdle)
-					// Async cleanup — don't block the main loop
 					go client.CleanupMessages()
 				}
 			default:
@@ -554,21 +709,18 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 				}
 				call = c
 			case msg := <-client.TextMsgCh:
-				// Handle terminal relay messages while waiting for calls
 				if strings.HasPrefix(msg, "BLECMD:") || strings.HasPrefix(msg, "BLERSZ:") || strings.HasPrefix(msg, "BLEEND:") {
-					// Terminal relay removed — commands now go via VPN proxy
 					continue
 				}
-				// Handle ENDCALL while waiting for calls (server is idle, no active call)
-				// Send ACK so the client knows the server is ready
-				if msg == "BLETUN:ENDCALL" && expectedCallerID != 0 {
-					mainLog.Info("%s Received ENDCALL while idle — sending ACK", label)
+				if strings.HasPrefix(msg, "BLETUN:ENDCALL") {
+					caller := lookupCaller(msg)
+					mainLog.Info("%s Received ENDCALL while idle — sending ACK to %d", label, caller)
 					adminPanel.AddLog("info", label+" 📴 ENDCALL received (idle) — sending ACK")
-					client.SendTextMessage(expectedCallerID, "BLETUN:ENDCALL_ACK")
-					// Also force-end in router + set IDLE (in case of stale state)
+					if caller != 0 {
+						client.SendTextMessage(caller, "BLETUN:ENDCALL_ACK")
+					}
 					callRouter.ForceEndCall(account.ID)
 					serverDB.SetAccountStatus(account.ID, db.StatusIdle)
-					// Async cleanup — don't block the main loop
 					go client.CleanupMessages()
 				}
 				continue
@@ -632,9 +784,21 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 		})
 
 		sessionCtx, sessionCancel := context.WithCancel(ctx)
+		if session != nil {
+			session.SetCancelFunc(sessionCancel)
+			cID := call.CallID
+			session.SetDiscardFunc(func() {
+				client.DiscardCall(cID)
+			})
+		}
 		mainLog.Info("%s Connecting to LiveKit SFU...", tag)
 
-		sfuTransport := livekit.NewSFUTransport(&sessionCfg, serverObf)
+		actualCallerID := call.CallerID
+		if actualCallerID == 0 {
+			actualCallerID = lookupCaller("")
+		}
+
+		sfuTransport := livekit.NewSFUTransport(&sessionCfg, getServerObfuscator(cfg))
 		if err := sfuTransport.Connect(sessionCtx); err != nil {
 			adminPanel.AddLog("error", tag+" SFU connect failed: "+err.Error())
 			mainLog.Error("%s SFU connect failed: %v", tag, err)
@@ -646,12 +810,14 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 		}
 		adminPanel.AddLog("info", tag+" ✅ SFU connected!")
 
-		// Run tunnel session in goroutine
+		// Run tunnel session in goroutine and coordinate cleanly
+		sessionDone := make(chan struct{})
 		go func(sctx context.Context, scancel context.CancelFunc, sfu *livekit.SFUTransport, sTag string, cID int64, sNum int, sess *router.Session) {
+			defer close(sessionDone)
 			defer scancel()
 			defer sfu.Close()
 
-			handleSFUProxy(sctx, cfg, sfu, adminPanel, client, sTag, expectedCallerID)
+			handleSFUProxy(sctx, cfg, sfu, adminPanel, client, sTag, actualCallerID)
 
 			mainLog.Info("%s Tunnel ended — cleaning up", sTag)
 			adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
@@ -674,10 +840,51 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 			mainLog.Info("%s ✅ Cleanup done", sTag)
 		}(sessionCtx, sessionCancel, sfuTransport, tag, call.CallID, sessionNum, session)
 
+		// Synchronize: while session is running, monitor for ENDCALL/END from client or context cancel
+		sessionActive := true
+		for sessionActive {
+			select {
+			case <-ctx.Done():
+				sessionCancel()
+				sessionActive = false
+			case <-sessionDone:
+				sessionActive = false
+			case msg := <-client.TextMsgCh:
+				if strings.HasPrefix(msg, "BLETUN:ENDCALL") {
+					caller := lookupCaller(msg)
+					if caller == 0 {
+						caller = actualCallerID
+					}
+					mainLog.Info("%s 📴 Received ENDCALL during active session — terminating session and sending ACK to %d", tag, caller)
+					adminPanel.AddLog("info", tag+" 📴 ENDCALL received — terminating session")
+					sessionCancel()
+					client.DiscardCall(call.CallID)
+					callRouter.ForceEndCall(account.ID)
+					serverDB.SetAccountStatus(account.ID, db.StatusIdle)
+					if caller != 0 {
+						client.SendTextMessage(caller, "BLETUN:ENDCALL_ACK")
+					}
+					select {
+					case <-sessionDone:
+					case <-time.After(3 * time.Second):
+					}
+					sessionActive = false
+				} else if msg == "BLETUN:END" || strings.HasPrefix(msg, "BLETUN:END") {
+					mainLog.Info("%s Client sent BLETUN:END — terminating session", tag)
+					adminPanel.AddLog("info", tag+" Client sent END")
+					sessionCancel()
+					select {
+					case <-sessionDone:
+					case <-time.After(3 * time.Second):
+					}
+					sessionActive = false
+				}
+			}
+		}
+
 		time.Sleep(1 * time.Second)
 	}
 }
-
 
 func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTransport, adminPanel *admin.Server, baleClient *bale.Client, tag string, callerID int64) {
 	// Wait for remote track (client's video through SFU)
@@ -712,17 +919,20 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	// Create a dedicated OpusPacketConn for this lane's QUIC server.
 	opusPacketInterface := quicconn.NewServer(rtpConn)
 
+	// MTU CLAMPING: 1060 bytes (QUIC) + 40 bytes (XChaCha20 envelope) +
+	// 33 bytes (Opus TOC + max VBR padding) = 1133 bytes wire footprint.
+	// Must match client config to prevent SFU UDP truncation.
 	quicCfg := &quic.Config{
-		InitialPacketSize:               1140,
-		MaxIdleTimeout:                  45 * time.Second,
-		KeepAlivePeriod:                 10 * time.Second,
-		MaxIncomingStreams:              10000,
-		MaxIncomingUniStreams:           10000,
-		InitialStreamReceiveWindow:      4 * 1024 * 1024,
-		MaxStreamReceiveWindow:          32 * 1024 * 1024,
-		InitialConnectionReceiveWindow:  8 * 1024 * 1024,
-		MaxConnectionReceiveWindow:      64 * 1024 * 1024,
-		DisablePathMTUDiscovery:         true,
+		InitialPacketSize:              1060,
+		MaxIdleTimeout:                 45 * time.Second,
+		KeepAlivePeriod:                10 * time.Second,
+		MaxIncomingStreams:             10000,
+		MaxIncomingUniStreams:          10000,
+		InitialStreamReceiveWindow:     8 * 1024 * 1024,
+		MaxStreamReceiveWindow:         64 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     128 * 1024 * 1024,
+		DisablePathMTUDiscovery:        true,
 	}
 
 	// Host a dedicated QUIC server instance strictly for this channel pair.
@@ -736,9 +946,15 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	defer listener.Close()
 
 	// Accept the client's QUIC connection (with timeout).
-	const acceptTimeout = 90 * time.Second
+	const acceptTimeout = 40 * time.Second
 	accCtx, accCancel := context.WithTimeout(ctx, acceptTimeout)
 	defer accCancel()
+
+	// Immediately close listener when context is cancelled so Accept unblocks instantly
+	go func() {
+		<-accCtx.Done()
+		listener.Close()
+	}()
 
 	qconn, err := listener.Accept(accCtx)
 	if err != nil {
@@ -756,7 +972,7 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 
 	// Monitor
 	// Drain stale text messages (BLETUN:END from previous --disconnect runs)
-	drainLoop:
+drainLoop:
 	for {
 		select {
 		case msg := <-baleClient.TextMsgCh:
@@ -770,7 +986,7 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	sessionStart := time.Now()
 	gracePeriod := 10 * time.Second
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -778,7 +994,7 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 			mainLog.Info("%s Context cancelled", tag)
 			return
 		case msg := <-baleClient.TextMsgCh:
-			if msg == "BLETUN:END" {
+			if msg == "BLETUN:END" || strings.HasPrefix(msg, "BLETUN:END") {
 				if time.Since(sessionStart) < gracePeriod {
 					mainLog.Info("%s Ignoring stale BLETUN:END (within %v grace period)", tag, gracePeriod)
 					continue
@@ -787,7 +1003,7 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 				mainLog.Info("%s Client sent BLETUN:END", tag)
 				return
 			}
-			if msg == "BLETUN:ENDCALL" {
+			if strings.HasPrefix(msg, "BLETUN:ENDCALL") {
 				mainLog.Info("%s 📴 Received ENDCALL command — ending active call", tag)
 				adminPanel.AddLog("info", tag+" 📴 ENDCALL received — ending call and sending ACK")
 				if callerID != 0 {
@@ -806,6 +1022,22 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 				mainLog.Info("%s QUIC connection closed", tag)
 				return
 			default:
+			}
+
+			// Inactivity watchdog: if the SFU reports remote participant disconnected
+			if sfu.IsPeerDisconnected() {
+				mainLog.Warn("%s ⏱️ SFU reported remote peer disconnected — cleanly closing call", tag)
+				adminPanel.AddLog("warn", tag+" ⏱️ Remote peer disconnected — closing call")
+				return
+			}
+
+			// Dead peer detection: zero inbound packets (data or silence) from client for 35s
+			silenceDuration := time.Since(rtpConn.LastInboundTime())
+			if silenceDuration > 35*time.Second {
+				mainLog.Warn("%s ⏱️ Dead peer detected: no inbound packets from client for %v — cleanly closing orphaned call",
+					tag, silenceDuration.Round(time.Second))
+				adminPanel.AddLog("warn", fmt.Sprintf("%s ⏱️ Client inactive for %v — auto-closing call", tag, silenceDuration.Round(time.Second)))
+				return
 			}
 			stats := sfu.GetStats()
 			bytesSent, _ := stats["bytes_sent"].(int64)
@@ -863,13 +1095,20 @@ func handleQUICStream(stream quic.Stream) {
 	targetAddr := string(addrBuf)
 	mainLog.Info("[QUIC-Stream] Proxying to %s", targetAddr)
 
-	// Dial the target
-	remote, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	// Dial the target with reduced timeout (5s instead of 10s for faster failure).
+	remote, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
 	if err != nil {
 		mainLog.Info("[QUIC-Stream] dial %s: %v", targetAddr, err)
 		return
 	}
 	defer remote.Close()
+
+	// TCP_NODELAY: disable Nagle's algorithm on the outbound connection so
+	// responses (especially small initial HTTP responses, TLS alerts, etc.)
+	// are sent immediately without 40ms coalescing delay.
+	if tc, ok := remote.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
 
 	// Bidirectional relay
 	done := make(chan struct{}, 2)
@@ -1117,5 +1356,3 @@ func itoa64(n int64) string {
 	}
 	return string(b)
 }
-
-

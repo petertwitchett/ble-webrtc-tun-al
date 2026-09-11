@@ -1,6 +1,16 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Card, Typography, Select, Button, Space, Row, Col, Tag, message, Descriptions, Badge, Alert, Upload, Divider } from 'antd';
-import { SyncOutlined, CloudSyncOutlined, CheckCircleOutlined, DownloadOutlined, UploadOutlined, DatabaseOutlined, ExclamationCircleOutlined, LinkOutlined, GlobalOutlined } from '@ant-design/icons';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import {
+  Card, Typography, Select, Button, Space, Row, Col, Tag, message,
+  Descriptions, Badge, Alert, Upload, Divider, Input, Table, Progress,
+  Popover, Switch, Popconfirm
+} from 'antd';
+import {
+  SyncOutlined, CloudSyncOutlined, CheckCircleOutlined, DownloadOutlined,
+  UploadOutlined, DatabaseOutlined, ExclamationCircleOutlined, LinkOutlined,
+  GlobalOutlined, SafetyCertificateOutlined, ApiOutlined,
+  PlayCircleOutlined, StopOutlined, DashboardOutlined,
+  RocketOutlined, SearchOutlined, UndoOutlined
+} from '@ant-design/icons';
 import { useTheme, THEMES, MODES } from '../../ThemeContext';
 import { api } from '../../api';
 
@@ -26,6 +36,185 @@ export function SettingsPage() {
   const [panelRole, setPanelRole] = useState<string>('');
   const [serverURLs, setServerURLs] = useState<string[]>([]);
   const [remoteServerURL, setRemoteServerURL] = useState<string>('');
+  const [baleConstants, setBaleConstants] = useState<any>(null);
+  const [baleSyncing, setBaleSyncing] = useState(false);
+  const [routing, setRouting] = useState({ dns_primary: '', dns_secondary: '', bypass_domains: '' });
+  const [routingSaving, setRoutingSaving] = useState(false);
+
+  // S3 Cloud Persistence state
+  const [s3Status, setS3Status] = useState<any>(null);
+  const [s3BackupLoading, setS3BackupLoading] = useState(false);
+  const [s3RestoreLoading, setS3RestoreLoading] = useState(false);
+
+  const loadS3Status = useCallback(async () => {
+    try {
+      const res = await api.getS3Status();
+      setS3Status(res);
+    } catch {
+      // ignore if not supported
+    }
+  }, []);
+
+  useEffect(() => {
+    loadS3Status();
+  }, [loadS3Status]);
+
+  const handleS3BackupNow = async () => {
+    setS3BackupLoading(true);
+    try {
+      await api.triggerS3Backup();
+      message.success('Database successfully backed up to Cellar S3!');
+      await loadS3Status();
+    } catch (e: any) {
+      message.error(e.message || 'S3 backup failed');
+    } finally {
+      setS3BackupLoading(false);
+    }
+  };
+
+  const handleS3RestoreNow = async () => {
+    setS3RestoreLoading(true);
+    try {
+      const res = await api.triggerS3Restore();
+      if (res?.restored) {
+        message.success('Database successfully restored from S3!');
+      } else {
+        message.info(res?.message || 'No backup found in S3');
+      }
+      await loadS3Status();
+    } catch (e: any) {
+      message.error(e.message || 'S3 restore failed');
+    } finally {
+      setS3RestoreLoading(false);
+    }
+  };
+
+  const [resetting, setResetting] = useState(false);
+  const [remoteResetting, setRemoteResetting] = useState(false);
+
+  const handleResetDatabase = async () => {
+    setResetting(true);
+    try {
+      const res = await api.dbReset();
+      message.success(res?.message || 'Database reset successfully: accounts, pairings, and logs cleared.');
+      loadSyncStatus();
+      loadS3Status();
+    } catch (e: any) {
+      message.error(e.message || 'Database reset failed');
+    } finally {
+      setResetting(false);
+    }
+  };
+
+  const handleResetRemoteDatabase = async () => {
+    setRemoteResetting(true);
+    try {
+      const res = await api.remoteDBReset();
+      message.success(res?.message || 'Remote server database reset successfully.');
+      loadSyncStatus();
+    } catch (e: any) {
+      message.error(e.message || 'Remote database reset failed');
+    } finally {
+      setRemoteResetting(false);
+    }
+  };
+
+  // DNS Speed Benchmark state
+  const [benchmarkStatus, setBenchmarkStatus] = useState<any>(null);
+  const [benchmarkLoading, setBenchmarkLoading] = useState(false);
+  const [dnsSearch, setDnsSearch] = useState('');
+  const [onlineOnly, setOnlineOnly] = useState(true);
+
+  const pollBenchmark = useCallback(async () => {
+    try {
+      const res = await api.dnsBenchmarkStatus();
+      setBenchmarkStatus(res);
+      return res;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    pollBenchmark();
+  }, [pollBenchmark]);
+
+  // Polling loop when benchmark is active
+  useEffect(() => {
+    let timer: any = null;
+    if (benchmarkStatus?.running) {
+      timer = setInterval(async () => {
+        const res = await pollBenchmark();
+        if (res && !res.running) {
+          clearInterval(timer);
+        }
+      }, 1000);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [benchmarkStatus?.running, pollBenchmark]);
+
+  const handleStartBenchmark = async () => {
+    setBenchmarkLoading(true);
+    try {
+      await api.dnsBenchmarkStart();
+      message.success('DNS benchmark started — testing servers against Google and Bale Meet gateways...');
+      await pollBenchmark();
+    } catch (e: any) {
+      message.error(e.message || 'Failed to start benchmark');
+    } finally {
+      setBenchmarkLoading(false);
+    }
+  };
+
+  const handleStopBenchmark = async () => {
+    try {
+      await api.dnsBenchmarkStop();
+      message.info('DNS benchmark stopped');
+      await pollBenchmark();
+    } catch (e: any) {
+      message.error(e.message || 'Failed to stop benchmark');
+    }
+  };
+
+  const handleApplyDNS = async (primary: string, secondary: string) => {
+    const newRouting = {
+      dns_primary: primary,
+      dns_secondary: secondary,
+      bypass_domains: routing.bypass_domains,
+    };
+    try {
+      await api.updateRoutingSettings(newRouting);
+      setRouting(newRouting);
+      message.success(`Applied DNS: Primary=${primary} | Secondary=${secondary} — active traffic routing updated`);
+    } catch (e: any) {
+      message.error(e.message || 'Failed to apply DNS');
+    }
+  };
+
+  const handleResetDNS = async () => {
+    setRoutingSaving(true);
+    try {
+      const resetRouting = {
+        dns_primary: '',
+        dns_secondary: '',
+        bypass_domains: panelRole === 'SERVER' ? '' : routing.bypass_domains,
+      };
+      await api.updateRoutingSettings(resetRouting);
+      setRouting(resetRouting);
+      message.success(
+        panelRole === 'SERVER'
+          ? 'Bale DNS reset to Native Host DNS — now resolving via Clever Cloud OS resolver'
+          : 'DNS settings reset to default host resolver'
+      );
+      await loadRoutingSettings();
+    } catch (e: any) {
+      message.error(e.message || 'Failed to reset DNS');
+    } finally {
+      setRoutingSaving(false);
+    }
+  };
 
   const loadSyncStatus = useCallback(async () => {
     try {
@@ -40,7 +229,42 @@ export function SettingsPage() {
     } catch { /* ignore */ }
   }, []);
 
-  useEffect(() => { loadSyncStatus(); }, [loadSyncStatus]);
+  const loadBaleConstants = useCallback(async () => {
+    try {
+      const data = await api.getBaleConstants();
+      setBaleConstants(data);
+    } catch { /* ignore */ }
+  }, []);
+
+  const loadRoutingSettings = useCallback(async () => {
+    try {
+      const data = await api.getRoutingSettings();
+      setRouting({
+        dns_primary: data.dns_primary || '',
+        dns_secondary: data.dns_secondary || '',
+        bypass_domains: data.bypass_domains || '',
+      });
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => { loadSyncStatus(); loadBaleConstants(); loadRoutingSettings(); }, [loadSyncStatus, loadBaleConstants, loadRoutingSettings]);
+
+  const handleBaleSync = async () => {
+    setBaleSyncing(true);
+    try {
+      const data = await api.syncBaleConstants();
+      if (data.status === 'success') {
+        setBaleConstants(data);
+        message.success('Bale constants synchronized from upstream');
+      } else {
+        message.error(data.message || 'Sync failed');
+      }
+    } catch (e: any) {
+      message.error(e.message || 'Failed to sync Bale constants');
+    } finally {
+      setBaleSyncing(false);
+    }
+  };
 
   const handleManualSync = async () => {
     setSyncing(true);
@@ -68,6 +292,150 @@ export function SettingsPage() {
     }
   };
 
+
+  const topOnlineServers = useMemo(() => {
+    if (!benchmarkStatus?.results) return [];
+    return benchmarkStatus.results.filter((r: any) => r.online);
+  }, [benchmarkStatus?.results]);
+
+  const filteredResults = useMemo(() => {
+    if (!benchmarkStatus?.results) return [];
+    let list = benchmarkStatus.results;
+    if (onlineOnly) {
+      list = list.filter((r: any) => r.online);
+    }
+    if (dnsSearch.trim()) {
+      const q = dnsSearch.trim().toLowerCase();
+      list = list.filter((r: any) => r.ip.toLowerCase().includes(q));
+    }
+    return list;
+  }, [benchmarkStatus?.results, onlineOnly, dnsSearch]);
+
+  const dnsColumns = [
+    {
+      title: 'Rank',
+      key: 'rank',
+      width: 75,
+      render: (_: any, r: any) => {
+        if (!r.online) return <Tag color="default">Off</Tag>;
+        const colors: Record<number, string> = { 1: '#f59e0b', 2: '#94a3b8', 3: '#d97706' };
+        return (
+          <Tag color={colors[r.rank] || 'blue'} className="font-bold text-xs">
+            #{r.rank}
+          </Tag>
+        );
+      },
+    },
+    {
+      title: 'DNS Server IP',
+      dataIndex: 'ip',
+      key: 'ip',
+      render: (ip: string) => (
+        <Space size="small">
+          <Text strong className="font-mono text-sm">{ip}</Text>
+          {routing.dns_primary === ip && <Tag color="green">Primary</Tag>}
+          {routing.dns_secondary === ip && <Tag color="cyan">Secondary</Tag>}
+        </Space>
+      ),
+    },
+    {
+      title: 'Global Avg',
+      key: 'global_avg_ms',
+      sorter: (a: any, b: any) => (a.global_avg_ms > 0 ? a.global_avg_ms : 9999) - (b.global_avg_ms > 0 ? b.global_avg_ms : 9999),
+      render: (_: any, r: any) => {
+        if (!r.online || r.global_avg_ms < 0) return <Text type="secondary">—</Text>;
+        const color = r.global_avg_ms < 60 ? 'green' : r.global_avg_ms < 120 ? 'blue' : r.global_avg_ms < 200 ? 'orange' : 'red';
+        return <Tag color={color} className="font-semibold">{r.global_avg_ms} ms</Tag>;
+      },
+    },
+    {
+      title: 'Bale Meet Gateways',
+      key: 'bale_avg_ms',
+      sorter: (a: any, b: any) => (a.bale_avg_ms > 0 ? a.bale_avg_ms : 9999) - (b.bale_avg_ms > 0 ? b.bale_avg_ms : 9999),
+      render: (_: any, r: any) => {
+        if (!r.online || r.bale_avg_ms < 0) return <Text type="secondary">—</Text>;
+        const content = (
+          <div className="text-xs p-1 space-y-1 font-mono">
+            <div className="font-bold border-b pb-1 mb-1">Meet Gateways (meet-gwbm[1..6].ble.ir):</div>
+            {[1, 2, 3, 4, 5, 6].map((i) => {
+              const val = r.bale_gateways?.[`B${i}`];
+              return (
+                <div key={i} className="flex justify-between gap-4">
+                  <span className="text-slate-500">Gateway {i}:</span>
+                  <span className={val > 0 ? 'text-emerald-600 font-bold' : 'text-rose-500'}>
+                    {val > 0 ? `${val} ms` : 'Failed'}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        );
+        return (
+          <Popover content={content} title="Gateway Latency Breakdown" trigger="hover">
+            <Tag color="cyan" className="cursor-pointer font-semibold">
+              {r.bale_avg_ms} ms (B1-B6 ℹ)
+            </Tag>
+          </Popover>
+        );
+      },
+    },
+    {
+      title: 'Google',
+      key: 'google_avg_ms',
+      render: (_: any, r: any) => {
+        if (!r.online || r.google_avg_ms < 0) return <Text type="secondary">X</Text>;
+        return <Text className="font-mono text-xs">{r.google_avg_ms} ms</Text>;
+      },
+    },
+    {
+      title: 'Reliability',
+      dataIndex: 'reliability',
+      key: 'reliability',
+      sorter: (a: any, b: any) => a.reliability - b.reliability,
+      render: (val: number, r: any) => {
+        if (!r.online) return <Tag color="error">0%</Tag>;
+        const color = val === 100 ? 'success' : val >= 80 ? 'processing' : 'warning';
+        return <Tag color={color} className="font-semibold">{val}%</Tag>;
+      },
+    },
+    {
+      title: 'Score',
+      dataIndex: 'score',
+      key: 'score',
+      sorter: (a: any, b: any) => a.score - b.score,
+      render: (val: number, r: any) => {
+        if (!r.online || val >= 1000000) return <Text type="secondary">—</Text>;
+        return <Text className="font-mono text-xs">{val}</Text>;
+      },
+    },
+    {
+      title: 'Actions',
+      key: 'actions',
+      render: (_: any, r: any) => {
+        if (!r.online) return null;
+        return (
+          <Space size="small">
+            <Button
+              size="small"
+              type={routing.dns_primary === r.ip ? 'primary' : 'default'}
+              onClick={() => handleApplyDNS(r.ip, routing.dns_secondary)}
+              title="Set as Primary DNS"
+            >
+              Primary
+            </Button>
+            <Button
+              size="small"
+              type={routing.dns_secondary === r.ip ? 'primary' : 'default'}
+              onClick={() => handleApplyDNS(routing.dns_primary, r.ip)}
+              title="Set as Secondary DNS"
+            >
+              Secondary
+            </Button>
+          </Space>
+        );
+      },
+    },
+  ];
 
   return (
     <div className="space-y-6">
@@ -152,14 +520,348 @@ export function SettingsPage() {
         </Row>
       </Card>
 
+      {/* Bale Client Constants — Dynamic Upstream Parameter Extraction */}
+      <Card
+        title={<><CloudSyncOutlined className="mr-2" />Bale Client Constants</>}
+        bordered={false}
+        className="shadow-sm mb-6"
+        extra={
+          <Space>
+            <Button
+              type="primary"
+              icon={<SyncOutlined spin={baleSyncing} />}
+              loading={baleSyncing}
+              onClick={handleBaleSync}
+            >
+              Sync from Bale
+            </Button>
+          </Space>
+        }
+      >
+        <Alert
+          message="Dynamic Upstream Parameter Extraction"
+          description="Bale updates client protocol parameters with each release. Click 'Sync from Bale' to scrape the live web bundle (web.bale.ai) and hot-swap these constants — new connections immediately use the updated values without a restart."
+          type="info"
+          showIcon
+          icon={<CloudSyncOutlined />}
+          className="mb-4"
+        />
+
+        {baleConstants ? (
+          <>
+            <Descriptions column={{ xs: 1, md: 2 }} size="small" bordered>
+              <Descriptions.Item label="App Version">
+                <Tag color="blue" className="font-mono">{baleConstants.app_version || '—'}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="LiveKit SDK Version">
+                <Tag color="geekblue" className="font-mono">{baleConstants.livekit_sdk_version || '—'}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="LiveKit Protocol">
+                <Tag color="geekblue" className="font-mono">v{baleConstants.livekit_protocol_version || '—'}</Tag>
+                <Text type="secondary" className="ml-2 text-xs">subprotocol: lk-protocol-{baleConstants.livekit_protocol_version || '?'}</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="Browser Version">
+                <Tag color="cyan" className="font-mono">{baleConstants.browser_version || '—'}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="Bale WS URL" span={2}>
+                <Text className="font-mono text-xs">{baleConstants.bale_ws_url || '—'}</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="Bale gRPC Base" span={2}>
+                <Text className="font-mono text-xs">{baleConstants.bale_grpc_base || '—'}</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="LiveKit Origin">
+                <Text className="font-mono text-xs">{baleConstants.livekit_origin || '—'}</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="Bale Web Origin">
+                <Text className="font-mono text-xs">{baleConstants.bale_web_origin || '—'}</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="Web API Key" span={2}>
+                <Text className="font-mono text-xs" style={{ wordBreak: 'break-all' }}>
+                  {baleConstants.web_api_key ? `${baleConstants.web_api_key.slice(0, 12)}...${baleConstants.web_api_key.slice(-8)}` : '—'}
+                </Text>
+              </Descriptions.Item>
+            </Descriptions>
+
+            <div className="mt-3 text-xs text-slate-400">
+              <Badge
+                status={baleSyncing ? 'processing' : (baleConstants.last_synced_at ? 'success' : 'default')}
+                text={
+                  baleSyncing ? 'Extracting parameters from upstream...'
+                    : baleConstants.last_synced_at
+                      ? `Last synced: ${baleConstants.last_synced_at}`
+                      : 'Never synced — using default values'
+                }
+              />
+            </div>
+          </>
+        ) : (
+          <Text type="secondary">Loading Bale client constants...</Text>
+        )}
+      </Card>
+
+      {/* Application-Level DNS / Bale Dedicated Split-DNS */}
+      <Card
+        title={
+          <div className="flex items-center gap-2">
+            {panelRole === 'SERVER' ? (
+              <>
+                <ApiOutlined className="text-blue-500" />
+                <span>Bale Dedicated Split-DNS (WebSocket &amp; WebRTC Acceleration)</span>
+                {routing.dns_primary || routing.dns_secondary ? (
+                  <Tag color="green">⚡ Split-DNS Active</Tag>
+                ) : (
+                  <Tag color="default">🌐 Native Clever Cloud DNS (Default)</Tag>
+                )}
+              </>
+            ) : (
+              <>
+                <SafetyCertificateOutlined className="mr-2" />
+                <span>Application DNS &amp; Split-Tunneling</span>
+                {routing.dns_primary || routing.dns_secondary ? (
+                  <Tag color="green">Active</Tag>
+                ) : (
+                  <Tag color="default">Default</Tag>
+                )}
+              </>
+            )}
+          </div>
+        }
+        bordered={false}
+        className="shadow-sm mb-6"
+        extra={
+          <Space>
+            {(routing.dns_primary || routing.dns_secondary) && (
+              <Popconfirm
+                title={panelRole === 'SERVER' ? 'Reset Bale DNS to Native Clever Cloud DNS?' : 'Reset DNS to default?'}
+                description={
+                  panelRole === 'SERVER'
+                    ? 'Bale WebSocket and WebRTC connections will revert to resolving via Clever Cloud host OS resolver.'
+                    : 'Traffic will revert to resolving via host default resolver.'
+                }
+                onConfirm={handleResetDNS}
+                okText="Reset DNS"
+                cancelText="Cancel"
+              >
+                <Button icon={<UndoOutlined />} loading={routingSaving}>
+                  Reset to Native DNS
+                </Button>
+              </Popconfirm>
+            )}
+            <Button
+              type="primary"
+              icon={<SyncOutlined spin={routingSaving} />}
+              loading={routingSaving}
+              onClick={async () => {
+                setRoutingSaving(true);
+                try {
+                  await api.updateRoutingSettings({
+                    dns_primary: routing.dns_primary.trim(),
+                    dns_secondary: routing.dns_secondary.trim(),
+                    bypass_domains: panelRole === 'SERVER' ? '' : routing.bypass_domains.trim(),
+                  });
+                  message.success(
+                    panelRole === 'SERVER'
+                      ? 'Bale Split-DNS applied — Bale WebSocket & WebRTC connections updated'
+                      : 'Routing settings applied — new connections use updated DNS & bypass rules'
+                  );
+                  await loadRoutingSettings();
+                } catch (e: any) {
+                  message.error(e.message || 'Failed to save routing settings');
+                } finally {
+                  setRoutingSaving(false);
+                }
+              }}
+            >
+              Apply
+            </Button>
+          </Space>
+        }
+      >
+        {panelRole === 'SERVER' ? (
+          <Alert
+            message="Clever Cloud Split-DNS Isolation (Bale Only)"
+            description={
+              <div>
+                <p className="mb-1">
+                  Resolves domain names for <strong>Bale Signaling WebSocket</strong> (<code>web.bale.ir</code>), <strong>Bale WebRTC SFU Gateways</strong> (<code>meet-gwbm[1..6].ble.ir</code>), and <strong>STUN/TURN relays</strong> (<code>meet-turn.ble.ir</code>) exclusively through the high-speed DNS roots configured below.
+                </p>
+                <p className="mb-0 text-emerald-700 dark:text-emerald-400 font-medium">
+                  🛡️ All global internet proxy traffic forwarded by clients and internal Clever Cloud services (e.g. S3 Object Storage) strictly utilize the host's native DNS.
+                </p>
+              </div>
+            }
+            type="info"
+            showIcon
+            icon={<ApiOutlined />}
+            className="mb-4"
+          />
+        ) : (
+          <Alert
+            message="Application-Level DNS Resolution & Request Splitting"
+            description={
+              <div>
+                <p className="mb-1">All domain resolution and proxy traffic routing is performed through the DNS servers below, decoupled from the host OS resolver.</p>
+                <p className="mb-0">Iranian-domestic domains (servers hosted on Iranian IPs) and the custom bypass list below route <strong>directly over the local network</strong>, bypassing the WebRTC tunnel. Bale's own servers are never bypassed and always use the tunnel + custom DNS.</p>
+              </div>
+            }
+            type="info"
+            showIcon
+            icon={<ApiOutlined />}
+            className="mb-4"
+          />
+        )}
+
+        <Row gutter={[24, 16]}>
+          <Col xs={24} md={12}>
+            <Text type="secondary" strong className="block mb-2 uppercase text-xs tracking-wider">Primary DNS Server</Text>
+            <Input
+              size="large"
+              placeholder={panelRole === 'SERVER' ? '185.161.112.33 (or run benchmark below)' : '1.1.1.1'}
+              value={routing.dns_primary}
+              onChange={(e) => setRouting({ ...routing, dns_primary: e.target.value })}
+            />
+          </Col>
+          <Col xs={24} md={12}>
+            <Text type="secondary" strong className="block mb-2 uppercase text-xs tracking-wider">Secondary DNS Server</Text>
+            <Input
+              size="large"
+              placeholder={panelRole === 'SERVER' ? '185.161.112.34 (or run benchmark below)' : '1.0.0.1'}
+              value={routing.dns_secondary}
+              onChange={(e) => setRouting({ ...routing, dns_secondary: e.target.value })}
+            />
+          </Col>
+          {panelRole !== 'SERVER' && (
+            <Col xs={24}>
+              <Text type="secondary" strong className="block mb-2 uppercase text-xs tracking-wider">
+                Bypass Domains (comma-separated)
+              </Text>
+              <Input.TextArea
+                rows={3}
+                placeholder="example.com, bank.ir, my-site.ir"
+                value={routing.bypass_domains}
+                onChange={(e) => setRouting({ ...routing, bypass_domains: e.target.value })}
+              />
+              <Text type="secondary" className="block mt-2 text-xs">
+                Domains listed here (and their subdomains) bypass the tunnel and route directly over the local internet. Iranian-domestic IPs are detected automatically. Bale domains (<code>.bale.ai</code>, <code>.ble.ir</code>) are always tunneled.
+              </Text>
+            </Col>
+          )}
+        </Row>
+      </Card>
+
+      {/* DNS Speed Benchmark & Auto-Optimizer */}
+      <Card
+        title={
+          <div className="flex items-center gap-2">
+            <DashboardOutlined />
+            <span>DNS Speed Benchmark &amp; Auto-Optimizer</span>
+            {benchmarkStatus?.running && (
+              <Tag color="processing" className="animate-pulse">
+                SCANNING ({benchmarkStatus.percent}%)
+              </Tag>
+            )}
+          </div>
+        }
+        bordered={false}
+        className="shadow-sm mb-6"
+        extra={
+          <Space>
+            {topOnlineServers.length >= 2 && !benchmarkStatus?.running && (
+              <Button
+                type="dashed"
+                icon={<RocketOutlined />}
+                onClick={() => handleApplyDNS(topOnlineServers[0].ip, topOnlineServers[1].ip)}
+                title="Automatically configure Primary and Secondary DNS using the top 2 ranked servers"
+              >
+                ⚡ Auto-Apply Top 2 ({topOnlineServers[0].ip}, {topOnlineServers[1].ip})
+              </Button>
+            )}
+            {benchmarkStatus?.running ? (
+              <Button
+                danger
+                icon={<StopOutlined />}
+                onClick={handleStopBenchmark}
+              >
+                Stop Scan
+              </Button>
+            ) : (
+              <Button
+                type="primary"
+                icon={<PlayCircleOutlined />}
+                loading={benchmarkLoading}
+                onClick={handleStartBenchmark}
+                className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700"
+              >
+                {benchmarkStatus?.results?.length ? 'Re-scan DNS Servers' : 'Start DNS Benchmark'}
+              </Button>
+            )}
+          </Space>
+        }
+      >
+        <p className="text-secondary text-sm mb-4">
+          Benchmarks domestic and international DNS servers by probing <strong>google.com</strong> and all 6 domestic <strong>Bale Meet Gateways</strong> (<code>meet-gwbm1.ble.ir</code> to <code>meet-gwbm6.ble.ir</code>). The ranking algorithm heavily penalizes packet loss and gateway latency spikes to guarantee ultra-responsive Bale WebRTC tunneling.
+        </p>
+
+        {benchmarkStatus?.running && (
+          <div className="mb-6 p-4 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700">
+            <div className="flex justify-between items-center mb-2 text-sm">
+              <span className="font-semibold text-slate-700 dark:text-slate-300">
+                Scanning DNS servers... [{benchmarkStatus.completed} / {benchmarkStatus.total}]
+              </span>
+              <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                {benchmarkStatus.online_count} online servers found
+              </span>
+            </div>
+            <Progress
+              percent={benchmarkStatus.percent}
+              status="active"
+              strokeColor={{ from: '#3b82f6', to: '#6366f1' }}
+            />
+          </div>
+        )}
+
+        {/* Filters and Controls */}
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <Input
+            prefix={<SearchOutlined className="text-slate-400" />}
+            placeholder="Search by DNS IP..."
+            value={dnsSearch}
+            onChange={(e) => setDnsSearch(e.target.value)}
+            className="w-64"
+            allowClear
+          />
+          <div className="flex items-center gap-4 text-sm text-slate-500">
+            <div className="flex items-center gap-2">
+              <span>Show online only:</span>
+              <Switch checked={onlineOnly} onChange={setOnlineOnly} size="small" />
+            </div>
+            <span>
+              Total Tested: <strong>{benchmarkStatus?.results?.length || 0}</strong>
+              {benchmarkStatus?.online_count !== undefined && (
+                <> (<strong>{benchmarkStatus.online_count}</strong> active)</>
+              )}
+            </span>
+          </div>
+        </div>
+
+        {/* Results Table */}
+        <Table
+          dataSource={filteredResults}
+          columns={dnsColumns}
+          rowKey="ip"
+          size="middle"
+          pagination={{ pageSize: 15, showSizeChanger: true, pageSizeOptions: ['15', '30', '50', '100'] }}
+          className="overflow-x-auto"
+        />
+      </Card>
+
       {/* Server URLs */}
       {(serverURLs.length > 0 || remoteServerURL) && (
         <Card
           title={<><GlobalOutlined className="mr-2" />Server Addresses</>}
           bordered={false}
           className="shadow-sm mb-6"
-        >
-          <Text type="secondary" className="block mb-3">
+        >          <Text type="secondary" className="block mb-3">
             {panelRole === 'SERVER'
               ? 'This server is accessible at the following URLs:'
               : 'Connected remote server addresses:'}
@@ -305,6 +1007,111 @@ export function SettingsPage() {
         )}
       </Card>
 
+      {/* Cloud Database Persistence (Clever Cloud Cellar S3) - Active for SERVER */}
+      {(panelRole === 'SERVER' || s3Status?.configured) && (
+        <Card
+          title={<><CloudSyncOutlined className="mr-2 text-indigo-500" />Cloud Database Persistence (Clever Cloud Cellar S3)</>}
+          bordered={false}
+          className="shadow-sm mb-6"
+          extra={
+            s3Status?.configured ? (
+              <Tag color="success" icon={<CheckCircleOutlined />}>S3 Active & Synced</Tag>
+            ) : (
+              <Tag color="default">Not Configured</Tag>
+            )
+          }
+        >
+          <Alert
+            message="Auto-Restore on Startup & Real-Time Sync Active"
+            description="When deployed as a Docker container on Clever Cloud, container restarts normally discard local files. With Cellar S3 persistence enabled, the server automatically restores the database from S3 on startup, debounces and syncs every change in real time, and flushes before shutdown."
+            type={s3Status?.configured ? "success" : "info"}
+            showIcon
+            icon={<CloudSyncOutlined />}
+            className="mb-4"
+          />
+
+          {s3Status?.configured ? (
+            <>
+              <Descriptions size="small" bordered column={{ xs: 1, sm: 2, md: 3 }} className="mb-4">
+                <Descriptions.Item label="S3 Host">
+                  <code>{s3Status.host || 'cellar-c2.services.clever-cloud.com'}</code>
+                </Descriptions.Item>
+                <Descriptions.Item label="Bucket">
+                  <Tag color="blue">{s3Status.bucket || 'ble-tunnel-server-db'}</Tag>
+                </Descriptions.Item>
+                <Descriptions.Item label="Last Sync">
+                  <Space size={4}>
+                    <Badge status="processing" />
+                    <span>{s3Status.last_sync_ago || 'Never'}</span>
+                  </Space>
+                </Descriptions.Item>
+                <Descriptions.Item label="Sync Count">
+                  {s3Status.sync_count} syncs completed
+                </Descriptions.Item>
+                <Descriptions.Item label="Database Size">
+                  {s3Status.db_size_bytes ? `${(s3Status.db_size_bytes / 1024).toFixed(1)} KB` : 'N/A'}
+                </Descriptions.Item>
+                <Descriptions.Item label="Boot Restore">
+                  <Tag color={s3Status.restored_init ? 'green' : 'cyan'}>
+                    {s3Status.restored_init ? 'Restored on Boot' : 'Ready'}
+                  </Tag>
+                </Descriptions.Item>
+              </Descriptions>
+
+              <Row gutter={[16, 16]}>
+                <Col xs={24} md={12}>
+                  <Card type="inner" title="Immediate S3 Backup" size="small">
+                    <Text type="secondary" className="block mb-3">
+                      Forces an immediate WAL checkpoint and uploads the latest database snapshot to Cellar S3.
+                    </Text>
+                    <Button
+                      type="primary"
+                      icon={<CloudSyncOutlined />}
+                      loading={s3BackupLoading || s3Status.is_syncing}
+                      onClick={handleS3BackupNow}
+                      block
+                    >
+                      {s3BackupLoading ? 'Syncing to S3...' : 'Backup to S3 Now'}
+                    </Button>
+                  </Card>
+                </Col>
+                <Col xs={24} md={12}>
+                  <Card type="inner" title="Restore from S3" size="small">
+                    <Text type="secondary" className="block mb-3">
+                      Fetches the latest database backup directly from your Clever Cloud Cellar S3 bucket.
+                    </Text>
+                    <Popconfirm
+                      title="Restore from S3?"
+                      description="This will overwrite the current database with the latest backup in S3."
+                      onConfirm={handleS3RestoreNow}
+                      okText="Restore"
+                      cancelText="Cancel"
+                      okButtonProps={{ danger: true }}
+                    >
+                      <Button
+                        icon={<DownloadOutlined />}
+                        loading={s3RestoreLoading}
+                        block
+                        danger
+                      >
+                        {s3RestoreLoading ? 'Restoring...' : 'Restore from S3 Now'}
+                      </Button>
+                    </Popconfirm>
+                  </Card>
+                </Col>
+              </Row>
+            </>
+          ) : (
+            <Alert
+              message="Cellar S3 Credentials"
+              description="To enable cloud database persistence, set CELLAR_ADDON_HOST, CELLAR_ADDON_KEY_ID, and CELLAR_ADDON_KEY_SECRET environment variables on Clever Cloud."
+              type="warning"
+              showIcon
+            />
+          )}
+        </Card>
+      )}
+
       <Card
         title={<><DatabaseOutlined className="mr-2" />Backup & Restore</>}
         bordered={false}
@@ -408,6 +1215,55 @@ export function SettingsPage() {
             </Card>
           </Col>
         </Row>
+
+        <Divider className="my-6" />
+
+        <div className="bg-red-500/5 dark:bg-red-500/10 border border-red-200 dark:border-red-900/40 rounded-xl p-4">
+          <Row gutter={[16, 16]} align="middle" justify="space-between">
+            <Col xs={24} lg={15}>
+              <Space direction="vertical" size={2}>
+                <Text strong className="text-red-600 dark:text-red-400 text-base">
+                  <ExclamationCircleOutlined className="mr-1.5" />
+                  Reset Database (Factory Clean)
+                </Text>
+                <Text type="secondary" className="text-xs block">
+                  Permanently clears all accounts, pairings, connection logs, and sync events from the database.
+                  <strong> Settings (Bale parameters, DNS, Appearance) and Admin logins are safely preserved.</strong>
+                </Text>
+              </Space>
+            </Col>
+            <Col xs={24} lg={9} className="text-right">
+              <Space wrap>
+                {panelRole === 'CLIENT' && remoteServerURL && (
+                  <Popconfirm
+                    title="Reset Remote Server Database?"
+                    description="This will clear all accounts, pairings, and logs on the Clever Cloud server. Settings and admin credentials will be preserved."
+                    onConfirm={handleResetRemoteDatabase}
+                    okText="Yes, Reset Server DB"
+                    cancelText="Cancel"
+                    okButtonProps={{ danger: true }}
+                  >
+                    <Button danger loading={remoteResetting}>
+                      Reset Server DB
+                    </Button>
+                  </Popconfirm>
+                )}
+                <Popconfirm
+                  title="Reset Database?"
+                  description="Permanently clear all accounts, pairings, and logs? Settings and admin logins will be preserved."
+                  onConfirm={handleResetDatabase}
+                  okText="Yes, Reset Everything"
+                  cancelText="Cancel"
+                  okButtonProps={{ danger: true }}
+                >
+                  <Button type="primary" danger loading={resetting}>
+                    Reset {panelRole === 'SERVER' ? 'Server' : 'Local'} Database
+                  </Button>
+                </Popconfirm>
+              </Space>
+            </Col>
+          </Row>
+        </div>
       </Card>
 
       <Card title="Theme Preview" bordered={false} className="shadow-sm">

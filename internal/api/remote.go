@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 )
@@ -340,6 +341,30 @@ func (s *Server) handleRemoteDBRestore(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
+// handleRemoteDBReset proxies POST /api/db/reset to the remote server.
+func (s *Server) handleRemoteDBReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.RemoteServerURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "remote server URL not configured")
+		return
+	}
+
+	resp, err := s.proxyToRemote("POST", "/api/db/reset", r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("remote server error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
 // handleRemotePullAccounts pulls SERVER accounts from the remote server
 // and inserts them locally if they don't already exist.
 // POST /api/remote/pull-accounts
@@ -458,8 +483,9 @@ func (s *Server) handleRemoteSyncFromServer(w http.ResponseWriter, r *http.Reque
 	}
 
 	var snapshot struct {
-		Version  int64 `json:"version"`
-		Accounts []struct {
+		Version           int64  `json:"version"`
+		ObfuscationSecret string `json:"obfuscation_secret"`
+		Accounts          []struct {
 			BaleUserID  int64  `json:"bale_user_id"`
 			Role        string `json:"role"`
 			DisplayName string `json:"display_name"`
@@ -487,6 +513,12 @@ func (s *Server) handleRemoteSyncFromServer(w http.ResponseWriter, r *http.Reque
 	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
 		writeError(w, http.StatusBadGateway, "failed to decode server snapshot")
 		return
+	}
+
+	if snapshot.ObfuscationSecret != "" {
+		_ = s.database.SetSetting("obfuscation_secret", snapshot.ObfuscationSecret)
+		_ = os.Setenv("OBFUSCATION_SECRET", snapshot.ObfuscationSecret)
+		apiLog.Info("Synced obfuscation_secret from server")
 	}
 
 	accountsInserted := 0
@@ -574,6 +606,94 @@ func (s *Server) handleRemoteSyncFromServer(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// handleRemoteRoutingSettings proxies GET/POST /api/routing/settings to the remote server.
+func (s *Server) handleRemoteRoutingSettings(w http.ResponseWriter, r *http.Request) {
+	if s.RemoteServerURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "remote server URL not configured")
+		return
+	}
+	resp, err := s.proxyToRemote(r.Method, "/api/routing/settings", r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("remote server error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// handleRemoteDNSBenchmarkStart proxies POST /api/dns/benchmark/start to the remote server.
+func (s *Server) handleRemoteDNSBenchmarkStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.RemoteServerURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "remote server URL not configured")
+		return
+	}
+	resp, err := s.proxyToRemote("POST", "/api/dns/benchmark/start", r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("remote server error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// handleRemoteDNSBenchmarkStatus proxies GET /api/dns/benchmark/status to the remote server.
+func (s *Server) handleRemoteDNSBenchmarkStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.RemoteServerURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "remote server URL not configured")
+		return
+	}
+	resp, err := s.proxyToRemote("GET", "/api/dns/benchmark/status", nil)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("remote server error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// handleRemoteDNSBenchmarkStop proxies POST /api/dns/benchmark/stop to the remote server.
+func (s *Server) handleRemoteDNSBenchmarkStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.RemoteServerURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "remote server URL not configured")
+		return
+	}
+	resp, err := s.proxyToRemote("POST", "/api/dns/benchmark/stop", nil)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("remote server error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
 // proxyToRemote makes an authenticated HTTP request to the remote server.
 func (s *Server) proxyToRemote(method, path string, body io.Reader) (*http.Response, error) {
 	url := s.RemoteServerURL + path
@@ -583,8 +703,22 @@ func (s *Server) proxyToRemote(method, path string, body io.Reader) (*http.Respo
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 
-	// Use the same hardcoded admin credentials for the remote server
-	auth := base64.StdEncoding.EncodeToString([]byte("salman:Salman136517"))
+	// Use configured or default admin credentials for the remote server
+	authUser := os.Getenv("REMOTE_SERVER_USER")
+	if authUser == "" {
+		authUser = os.Getenv("ADMIN_USER")
+	}
+	if authUser == "" {
+		authUser = "azam"
+	}
+	authPass := os.Getenv("REMOTE_SERVER_PASS")
+	if authPass == "" {
+		authPass = os.Getenv("ADMIN_PASS")
+	}
+	if authPass == "" {
+		authPass = "136517"
+	}
+	auth := base64.StdEncoding.EncodeToString([]byte(authUser + ":" + authPass))
 	req.Header.Set("Authorization", "Basic "+auth)
 	req.Header.Set("Content-Type", "application/json")
 

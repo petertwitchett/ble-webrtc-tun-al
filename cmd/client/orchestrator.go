@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/salman/ble-webrtc-tun/internal/artery"
 	"github.com/salman/ble-webrtc-tun/internal/bale"
 	"github.com/salman/ble-webrtc-tun/internal/config"
 	"github.com/salman/ble-webrtc-tun/internal/pool"
@@ -167,7 +168,11 @@ func (tm *TunnelManager) endCallForPair(ctx context.Context, tp config.TokenPair
 drained:
 
 	mainLog.Info("[%s] ENDCALL: sending to %d", label, tp.TargetUserID)
-	if err := client.SendTextMessage(tp.TargetUserID, "BLETUN:ENDCALL"); err != nil {
+	endMsg := "BLETUN:ENDCALL"
+	if tp.ExpectedCallerID > 0 {
+		endMsg = fmt.Sprintf("BLETUN:ENDCALL:%d", tp.ExpectedCallerID)
+	}
+	if err := client.SendTextMessage(tp.TargetUserID, endMsg); err != nil {
 		mainLog.Warn("[%s] ENDCALL: send failed: %v", label, err)
 		if isTransient {
 			client.Close()
@@ -186,7 +191,7 @@ drained:
 			}
 			return false
 		case msg := <-client.TextMsgCh:
-			if msg == "BLETUN:ENDCALL_ACK" {
+			if msg == "BLETUN:ENDCALL_ACK" || strings.HasPrefix(msg, "BLETUN:ENDCALL_ACK") {
 				mainLog.Info("[%s] ENDCALL: ACK received — server is IDLE", label)
 				time.Sleep(500 * time.Millisecond)
 				client.CleanupMessages()
@@ -206,21 +211,18 @@ drained:
 	}
 }
 
-// initChannelWithRetry wraps initChannelTracked with the three-layer recovery:
+// initChannelWithRetry wraps initChannelTracked with the resilient recovery policy:
 //
 //  1. Layer 1: classify the failure phase and decide a targeted response.
 //  2. Layer 2: for call/SFU-phase failures, run the Clean Hangup Protocol
 //     (endCallForPair) to unstick the paired server before retrying.
-//  3. Exponential backoff with a cap; token/credential failures stop retrying.
-//
-// It returns nil only on a fatal (token) failure or context cancellation,
-// otherwise it keeps retrying until the channel connects successfully — exactly
-// the "repeat until this account connects successfully" requirement.
+//  3. Two-tier backoff cadence:
+//     - Tier 1 (burst): attempts 1-4: 1s, 2s, 4s, 8s (fast recovery for brief outages)
+//     - Tier 2 (sustained): attempts 5+: 15s, 30s, 60s, max 90s with ±20% jitter (low overhead during long outages)
+//  4. Instant wakeup via Network Watcher (tm.NetWakeup()) when network connectivity returns.
+//  5. Retries NEVER give up unless the user explicitly stops or token is revoked.
 func (tm *TunnelManager) initChannelWithRetry(ctx context.Context, idx int, tp config.TokenPair, label string) (*channelState, quic.Connection) {
-	backoff := 3 * time.Second
-	const maxBackoff = 30 * time.Second
-	baleFails := 0
-	const baleFailLimit = 8
+	attempt := 0
 
 	for {
 		select {
@@ -234,45 +236,70 @@ func (tm *TunnelManager) initChannelWithRetry(ctx context.Context, idx int, tp c
 			return ch, qconn
 		}
 
+		attempt++
 		errStr := ""
 		if failErr != nil {
 			errStr = failErr.Error()
 		}
 		cls := tm.classifyError(failPhase, errStr)
-		mainLog.Warn("[%s] init failed at %s (%s) class=%d — applying recovery", label, failPhase, errStr, cls)
+		mainLog.Warn("[%s] init failed at %s (%s) class=%d attempt=%d — applying recovery", label, failPhase, errStr, cls, attempt)
 
 		switch cls {
 		case classBaleConnect:
-			baleFails++
 			if isTokenError(errStr) {
 				tm.setChannelPhase(idx, PhaseError, "token revoked/expired: "+errStr)
 				mainLog.Error("[%s] Stopping retries — token appears invalid", label)
 				return nil, nil
 			}
-			if baleFails >= baleFailLimit {
-				tm.setChannelPhase(idx, PhaseError, fmt.Sprintf("Bale connect failed %d times: %s", baleFails, errStr))
-				mainLog.Error("[%s] Stopping retries after %d Bale connect failures", label, baleFails)
-				return nil, nil
-			}
-			// Network block / throttle — backoff only (no call was started).
+			tm.setChannelPhase(idx, PhaseDisconnected, fmt.Sprintf("Waiting to reconnect (attempt %d): %s", attempt, errStr))
 
 		case classCallPhase, classSFUPhase, classUnknown:
 			// Layer 2: the paired server may be stranded in RESERVED/IN_CALL.
 			// Force it back to IDLE before re-dialing so the retried call is
 			// accepted instead of rejected as "busy".
-			// The channel is dead at this point, so existingClient = nil:
-			// a transient client must be created (no collision risk here).
 			tm.setChannelPhase(idx, PhaseTeardown, "clean hangup of paired server")
 			tm.endCallForPair(ctx, tp, label, nil)
-			baleFails = 0
+			tm.setChannelPhase(idx, PhaseDisconnected, fmt.Sprintf("Reconnecting (attempt %d)...", attempt))
 		}
 
+		// Calculate 2-tier backoff:
+		var sleepDur time.Duration
+		switch {
+		case attempt == 1:
+			sleepDur = 1 * time.Second
+		case attempt == 2:
+			sleepDur = 2 * time.Second
+		case attempt == 3:
+			sleepDur = 4 * time.Second
+		case attempt == 4:
+			sleepDur = 8 * time.Second
+		case attempt == 5:
+			sleepDur = 15 * time.Second
+		case attempt == 6:
+			sleepDur = 30 * time.Second
+		case attempt == 7:
+			sleepDur = 60 * time.Second
+		default:
+			sleepDur = 90 * time.Second
+		}
+
+		if attempt >= 5 {
+			// Add ±20% jitter to prevent thundering herd across arteries
+			jitter := time.Duration((rand.Float64()*0.4 - 0.2) * float64(sleepDur))
+			sleepDur += jitter
+		}
+
+		mainLog.Info("[%s] Next reconnect attempt (#%d) in %v...", label, attempt+1, sleepDur.Round(100*time.Millisecond))
+
+		wakeCh := tm.NetWakeup()
 		select {
 		case <-ctx.Done():
 			return nil, nil
-		case <-time.After(backoff):
+		case <-wakeCh:
+			mainLog.Info("[%s] ⚡ Network restored! Waking up immediately to retry connection", label)
+			attempt = 0 // Reset to tier-1 fast burst
+		case <-time.After(sleepDur):
 		}
-		backoff = min(backoff*2, maxBackoff)
 	}
 }
 
@@ -280,6 +307,7 @@ func (tm *TunnelManager) initChannelWithRetry(ctx context.Context, idx int, tp c
 // re-establishes a fresh connection. Used by both:
 //   - Layer 2 death-reconnect (channel died unexpectedly)
 //   - Layer 3 scheduled refresh (healthy rotation)
+//   - Artery orchestrator autonomous revival
 //
 // It removes the QUIC connection from the routing pool (so traffic flows over
 // surviving connections), tears down Bale/SFU/QUIC, runs the Clean Hangup Protocol
@@ -299,7 +327,7 @@ func (tm *TunnelManager) refreshChannel(
 	channels *[]*channelState,
 ) {
 	// 1. Unregister the QUIC connection from the pool FIRST so the
-	//    round-robin balancer immediately steers traffic to other channels.
+	//    ECF scheduler immediately steers traffic to other arteries.
 	if *curQ != nil {
 		tunnelPool.Unregister(label)
 		time.Sleep(3 * time.Second) // allow active streams to drain
@@ -343,14 +371,20 @@ func (tm *TunnelManager) refreshChannel(
 	tm.setChannelPhase(idx, PhaseBaleConnect, "")
 	newCh, newQConn := tm.initChannelWithRetry(ctx, idx, tp, label)
 	if newCh == nil {
-		tm.setChannelPhase(idx, PhaseError, "reconnect yielded no channel — giving up")
+		if ctx.Err() != nil {
+			tm.setChannelPhase(idx, PhaseDisconnected, "stopped")
+		} else {
+			tm.setChannelPhase(idx, PhaseDisconnected, "reconnect paused")
+		}
 		return
 	}
 
 	tm.setChannelPhase(idx, PhaseTunnelActive, "")
 	// Register the new independent QUIC connection into the pool.
+	// Use RegisterWithIndex to associate the artery with its pair index
+	// for the orchestrator's telemetry tracking.
 	if newQConn != nil {
-		tunnelPool.Register(label, newQConn)
+		tunnelPool.RegisterWithIndex(label, newQConn, idx)
 	}
 	mu.Lock()
 	*channels = append(*channels, newCh)
@@ -359,4 +393,74 @@ func (tm *TunnelManager) refreshChannel(
 	*curCh = newCh
 	*curQ = newQConn
 	mainLog.Info("[%s] ✅ Channel refreshed/reconnected", label)
+}
+
+// =============================================================================
+// Artery Orchestrator Revival Bridge
+//
+// Bridges the artery.Orchestrator's autonomous revival pipeline to the
+// TunnelManager's refreshChannel() method.  When the orchestrator detects
+// a dead/quarantined artery, it calls this function which performs the
+// full Bale WS teardown, re-auth, SFU reconnect, and QUIC re-dial.
+// =============================================================================
+
+// startArteryOrchestrator creates and starts the artery orchestrator as a
+// background goroutine.  The revival callback is wired to refreshChannel.
+func (tm *TunnelManager) startArteryOrchestrator(
+	ctx context.Context,
+	tunnelPool *pool.TunnelPool,
+	channels *[]*channelState,
+	mu *sync.Mutex,
+	pairs []config.TokenPair,
+) *artery.Orchestrator {
+	revivalFn := func(revCtx context.Context, label string, pairIndex int) {
+		mainLog.Info("[Orchestrator] Revival triggered for %s (pair=%d)", label, pairIndex)
+
+		// Find the channel state and token pair for this artery
+		mu.Lock()
+		var curCh *channelState
+		for _, ch := range *channels {
+			if ch.label == label {
+				curCh = ch
+				break
+			}
+		}
+		mu.Unlock()
+
+		// Find the token pair
+		var tp config.TokenPair
+		if pairIndex >= 0 && pairIndex < len(pairs) {
+			tp = pairs[pairIndex]
+		} else {
+			mainLog.Error("[Orchestrator] Invalid pair index %d for %s", pairIndex, label)
+			return
+		}
+
+		var curQ quic.Connection
+		if curCh != nil {
+			curQ = curCh.qconn
+		}
+
+		// Perform the full refresh (teardown + re-auth + reconnect)
+		tm.refreshChannel(revCtx, tunnelPool, &curCh, &curQ, pairIndex, tp, label, mu, channels)
+
+		// After successful revival, transition the artery to SHADOW state
+		// for stabilization.  The orchestrator's hysteresis engine will
+		// promote it to ACTIVE after 15s if metrics are good.
+		if curCh != nil && curQ != nil {
+			a := tunnelPool.GetArtery(label)
+			if a != nil {
+				// The artery was re-registered by refreshChannel as ACTIVE.
+				// Transition to SHADOW for stabilization period.
+				_ = a.TransitionTo(artery.StateShadow)
+				mainLog.Info("[Orchestrator] %s revived — in SHADOW for stabilization", label)
+			}
+		} else {
+			mainLog.Warn("[Orchestrator] Revival of %s failed — artery stays in REVIVING/DEAD", label)
+		}
+	}
+
+	orch := artery.NewOrchestrator(tunnelPool.ArteryPool(), revivalFn)
+	go orch.Start(ctx)
+	return orch
 }

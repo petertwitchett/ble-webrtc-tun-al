@@ -45,26 +45,7 @@ func (s *Server) handleBaleLoginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Try to find an existing access_token from any account in the DB
-	// The Bale Envoy proxy requires a valid access_token cookie even for StartPhoneAuth
-	existingToken := ""
-	if accounts, err := s.database.ListAccounts(""); err == nil {
-		for _, acct := range accounts {
-			if acct.Token != "" {
-				existingToken = acct.Token
-				break
-			}
-		}
-	}
-
-	var authClient *bale.AuthClient
-	if existingToken != "" {
-		apiLog.Info("Using existing token for Bale auth cookie")
-		authClient = bale.NewAuthClientWithToken(existingToken)
-	} else {
-		apiLog.Warn("No existing token found — StartPhoneAuth may fail without cookie")
-		authClient = bale.NewAuthClient()
-	}
+	authClient := bale.NewAuthClient()
 	txHash, err := authClient.StartPhoneAuth(phone)
 	if err != nil {
 		apiLog.Warn("Bale login start failed for %s: %v", req.Phone, err)

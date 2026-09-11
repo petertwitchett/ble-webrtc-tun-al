@@ -5,8 +5,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io"
+	"github.com/salman/ble-webrtc-tun/internal/bale"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -40,18 +41,19 @@ type SFUTransport struct {
 	conn *websocket.Conn
 	mu   sync.RWMutex
 
-	pubPC  *webrtc.PeerConnection // publisher PC
-	subPC  *webrtc.PeerConnection // subscriber PC
-	track  *webrtc.TrackLocalStaticSample
+	pubPC     *webrtc.PeerConnection           // publisher PC
+	subPC     *webrtc.PeerConnection           // subscriber PC
+	tracks    []*webrtc.TrackLocalStaticSample // Opus track pool (multi-track camouflage)
+	numTracks int                              // configured track count for camouflage
 
 	// DataChannel for tunnel data - reliable/ordered SCTP (fallback)
-	pubDC   *webrtc.DataChannel // publisher _reliable data channel
-	dcReady chan struct{}        // closed when pubDC is open
+	pubDC    *webrtc.DataChannel // publisher _reliable data channel
+	dcReady  chan struct{}       // closed when pubDC is open
 	dataConn *dcconn.Conn        // io.ReadWriteCloser for yamux (DC mode)
 
 	// RTP audio tunnel (primary — DPI evasion)
-	rtpDataConn *rtpconn.Conn    // io.ReadWriteCloser for QUIC (RTP mode)
-	useRTP      bool             // true = tunnel via Opus RTP
+	rtpDataConn *rtpconn.Conn // io.ReadWriteCloser for QUIC (RTP mode)
+	useRTP      bool          // true = tunnel via Opus RTP
 
 	// Obfuscation layer (anti-DPI)
 	obfuscator *dcconn.Obfuscator
@@ -78,11 +80,22 @@ type SFUTransport struct {
 	pendingSubCandidates []webrtc.ICECandidateInit
 	pubRemoteSet         bool
 	subRemoteSet         bool
+
+	peerDisconnected atomic.Bool
 }
 
 // NewSFUTransport creates a transport that routes through the LiveKit SFU.
 // If obfuscator is nil, a passthrough (disabled) obfuscator is used.
+//
+// LINEARIZED TRANSPORT: Each SFU transport creates exactly ONE Opus audio
+// track.  Multi-track striping has been removed because it causes QUIC
+// congestion collapse via sub-transport packet reordering.  Bandwidth
+// aggregation across pairs is handled by the Artery Orchestrator ABOVE
+// QUIC, not below it.
 func NewSFUTransport(cfg *config.Config, obfuscator *dcconn.Obfuscator) *SFUTransport {
+	// Force exactly 1 track per artery to prevent sub-transport reordering.
+	// Multi-path bonding happens at the Orchestrator layer above QUIC.
+	numTracks := 1
 	s := &SFUTransport{
 		cfg:              cfg,
 		obfuscator:       obfuscator,
@@ -90,9 +103,11 @@ func NewSFUTransport(cfg *config.Config, obfuscator *dcconn.Obfuscator) *SFUTran
 		done:             make(chan struct{}),
 		dcReady:          make(chan struct{}),
 		subOfferCh:       make(chan struct{}, 1),
-		trackPublishedCh: make(chan struct{}, 1),
+		trackPublishedCh: make(chan struct{}, numTracks),
+		numTracks:        numTracks,
 	}
 	s.lastPongTime.Store(time.Now().UnixMilli())
+	sfuLog.Info("SFU transport: 1 audio track (linearized — no sub-transport reordering)")
 	return s
 }
 
@@ -109,11 +124,14 @@ func (s *SFUTransport) Connect(ctx context.Context) error {
 	dialer := websocket.Dialer{
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: false},
 		HandshakeTimeout: 15 * time.Second,
-		Subprotocols:     []string{"lk-protocol-15"},
+		Subprotocols:     []string{bale.ProtocolSubprotocol()},
+	}
+	if dc := appDial(); dc != nil {
+		dialer.NetDialContext = dc
 	}
 	headers := http.Header{
 		"User-Agent": []string{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-		"Origin":     []string{"https://web.ble.ir"},
+		"Origin":     []string{bale.LiveKitOrigin()},
 	}
 
 	conn, _, err := dialer.DialContext(ctx, wsURL, headers)
@@ -146,40 +164,51 @@ func (s *SFUTransport) Connect(ctx context.Context) error {
 	// 6. Start message reader
 	go s.readMessages(ctx)
 
-	// 7. Tell the SFU about our track BEFORE publishing (required by LiveKit)
-	// Use AUDIO track (Opus) — DPI sees a normal voice call
-	sfuLog.Info("Sending AddTrack request (Opus audio)...")
-	addTrackReq := &lkproto.SignalRequest{
-		Message: &lkproto.SignalRequest_AddTrack{
-			AddTrack: &lkproto.AddTrackRequest{
-				Cid:    s.track.ID(),
-				Name:   "audio",
-				Type:   lkproto.TrackType_AUDIO,
-				Source: lkproto.TrackSource_MICROPHONE,
+	// 7. Tell the SFU about ALL tracks BEFORE publishing (required by LiveKit)
+	// Use AUDIO tracks (Opus) — DPI sees a normal voice call with multiple lines
+	for i, track := range s.tracks {
+		sfuLog.Info("Sending AddTrack request %d/%d (Opus audio)...", i+1, len(s.tracks))
+		addTrackReq := &lkproto.SignalRequest{
+			Message: &lkproto.SignalRequest_AddTrack{
+				AddTrack: &lkproto.AddTrackRequest{
+					Cid:    track.ID(),
+					Name:   fmt.Sprintf("audio-%d", i),
+					Type:   lkproto.TrackType_AUDIO,
+					Source: lkproto.TrackSource_MICROPHONE,
+				},
 			},
-		},
-	}
-	if err := s.sendSignal(addTrackReq); err != nil {
-		return fmt.Errorf("AddTrack: %w", err)
-	}
-
-	// 8. Wait for TrackPublished confirmation from SFU
-	select {
-	case <-s.trackPublishedCh:
-		sfuLog.Info("✅ Track registered by SFU")
-	case <-time.After(10 * time.Second):
-		sfuLog.Warn("⚠️ TrackPublished timeout, publishing anyway")
+		}
+		if err := s.sendSignal(addTrackReq); err != nil {
+			return fmt.Errorf("AddTrack %d: %w", i+1, err)
+		}
 	}
 
-	// 9. Publish our video track — send offer to SFU
+	// 8. Wait for all TrackPublished confirmations from SFU
+	published := 0
+	deadline := time.After(10 * time.Second)
+	for published < len(s.tracks) {
+		select {
+		case <-s.trackPublishedCh:
+			published++
+			sfuLog.Info("✅ Track %d/%d registered by SFU", published, len(s.tracks))
+		case <-deadline:
+			sfuLog.Warn("⚠️ TrackPublished timeout (%d/%d), publishing anyway", published, len(s.tracks))
+			published = len(s.tracks) // break out of loop
+		}
+	}
+
+	// 9. Publish our audio tracks — send offer to SFU (includes all tracks)
 	if err := s.publishTrack(); err != nil {
 		return fmt.Errorf("publish: %w", err)
 	}
 
-	// 10. Setup data transport — prefer RTP audio tunnel for DPI evasion
-	// Create rtpconn adapter: yamux data flows through Opus RTP packets
+	// 10. Setup data transport — linearized 1:1 track-to-QUIC binding.
+	// Each artery gets exactly one Opus track to prevent sub-transport
+	// reordering that collapses QUIC's congestion window.
 	s.mu.Lock()
-	s.rtpDataConn = rtpconn.New(s.track, s.obfuscator) // encrypt payloads before they enter the Opus track
+	if len(s.tracks) > 0 {
+		s.rtpDataConn = rtpconn.New(s.tracks[0], s.obfuscator)
+	}
 	s.useRTP = true
 	s.connected = true
 	s.mu.Unlock()
@@ -227,6 +256,9 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 	// RTCPFeedback:nil strips congestion control, SDPFmtpLine mimics real Opus.
 
 	se := webrtc.SettingEngine{}
+	if n := getAppNet(); n != nil {
+		se.SetNet(n)
+	}
 	se.SetICETimeouts(5*time.Second, 25*time.Second, 2*time.Second)
 	se.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024)
 	se.SetNetworkTypes([]webrtc.NetworkType{
@@ -247,18 +279,24 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 		return err
 	}
 
-	// Create Opus audio track — DPI sees a normal voice call
-	track, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
-		"vpn-audio", "vpn-stream",
-	)
-	if err != nil {
-		return err
+	// Create exactly ONE Opus audio track — linearized transport.
+	// DPI sees a normal single-line voice call.
+	// Multi-path bonding is handled by the Artery Orchestrator above QUIC.
+	numTracks := 1 // Force 1 track per artery
+	s.tracks = s.tracks[:0] // reset
+	for i := 0; i < numTracks; i++ {
+		track, err := webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+			fmt.Sprintf("vpn-audio-%d", i), "vpn-stream",
+		)
+		if err != nil {
+			return err
+		}
+		if _, err := pc.AddTrack(track); err != nil {
+			return err
+		}
+		s.tracks = append(s.tracks, track)
 	}
-	if _, err := pc.AddTrack(track); err != nil {
-		return err
-	}
-
 
 	// No DataChannel needed — all tunnel data flows through Opus RTP.
 	// Creating a DataChannel would generate SCTP traffic detectable by DPI.
@@ -287,7 +325,6 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 	})
 
 	s.pubPC = pc
-	s.track = track
 	return nil
 }
 
@@ -308,6 +345,9 @@ func (s *SFUTransport) createSubscriber(iceServers []webrtc.ICEServer) error {
 	}
 
 	se := webrtc.SettingEngine{}
+	if n := getAppNet(); n != nil {
+		se.SetNet(n)
+	}
 	se.SetICETimeouts(5*time.Second, 25*time.Second, 2*time.Second)
 	se.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024)
 	se.SetNetworkTypes([]webrtc.NetworkType{
@@ -712,6 +752,14 @@ func (s *SFUTransport) handleSignalResponse(resp *lkproto.SignalResponse) {
 
 	case *lkproto.SignalResponse_Update:
 		sfuLog.Info("Participant update")
+		if msg.Update != nil {
+			for _, p := range msg.Update.GetParticipants() {
+				if p.GetState() == lkproto.ParticipantInfo_DISCONNECTED {
+					sfuLog.Warn("[SFU] Remote participant %s disconnected", p.GetIdentity())
+					s.peerDisconnected.Store(true)
+				}
+			}
+		}
 
 	case *lkproto.SignalResponse_TrackPublished:
 		cid := msg.TrackPublished.GetCid()
@@ -830,14 +878,15 @@ func (s *SFUTransport) readJoinResponse() (*lkproto.JoinResponse, []webrtc.ICESe
 
 	var servers []webrtc.ICEServer
 	for _, ice := range join.GetIceServers() {
-		srv := webrtc.ICEServer{URLs: ice.GetUrls()}
+		resolvedURLs := ResolveICEURLs(ice.GetUrls())
+		srv := webrtc.ICEServer{URLs: resolvedURLs}
 		if ice.GetUsername() != "" {
 			srv.Username = ice.GetUsername()
 			srv.Credential = ice.GetCredential()
 			srv.CredentialType = webrtc.ICECredentialTypePassword
 		}
 		servers = append(servers, srv)
-		sfuLog.Info("ICE: urls=%v user=%s", ice.GetUrls(), ice.GetUsername())
+		sfuLog.Info("ICE: urls=%v user=%s", resolvedURLs, ice.GetUsername())
 	}
 
 	return join, servers, nil
@@ -852,8 +901,8 @@ func (s *SFUTransport) buildWSURL() (string, error) {
 	q.Set("access_token", s.cfg.LiveKitToken)
 	q.Set("auto_subscribe", "1")
 	q.Set("sdk", "js")
-	q.Set("version", "2.13.6")
-	q.Set("protocol", "15")
+	q.Set("version", bale.SDKVersion())
+	q.Set("protocol", bale.ProtocolVersion())
 	q.Set("adaptive_stream", "1")
 	u.RawQuery = q.Encode()
 	return u.String(), nil
@@ -920,4 +969,9 @@ func (s *SFUTransport) bypassICEServerIPs(iceServers []webrtc.ICEServer) {
 			}
 		}
 	}
+}
+
+// IsPeerDisconnected returns true if the SFU reported the remote peer disconnected.
+func (s *SFUTransport) IsPeerDisconnected() bool {
+	return s.peerDisconnected.Load()
 }

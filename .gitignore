@@ -1,16 +1,60 @@
+# Binaries and build outputs
+/bin/
 bin/
-*.exe
-.env
-logs/
-.env.tokens
-data/
+/client
+/server
+/migrate
+/ble-client
+/ble-server
+cmd/client/client
+cmd/server/server
+cmd/migrate/migrate
 
-# Node
+# Cross-platform compiled executables and libraries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+
+# Delve debugger artifacts
+__debug_bin*
+debug.test
+
+# Go test binaries and profiling outputs
+*.test
+*.out
+*.prof
+*.coverprofile
+pprof
+
+# Go workspace
+go.work
+go.work.sum
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+.env.tokens
+
+# Runtime data and logs
+data/
+logs/
+*.log
+
+# Database files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Node frontend artifacts
 node_modules/
 web/node_modules/
 web/dist/
-#package.json
-#package-lock.json
 
 # Embedded UI dist is committed (it's embedded into the Go binary)
 # Run `make build-web` to update it before committing
@@ -22,10 +66,8 @@ bale_cdp_traffic.log
 sniffer.py
 sniffer2.py
 auth_bridge.py
-*.log
 
-# Build artifacts
-migrate
+# Build artifacts & test scripts
 sniff_output/
 tools/sniff_logs/
 cmd/sniff/
@@ -33,7 +75,9 @@ cmd/test/
 cmd/baletest/
 test_restricted_wifi.sh
 
-# Database files
-*.db
-ble-client
-ble-server
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

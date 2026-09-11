@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
-
-	"github.com/salman/ble-webrtc-tun/internal/db"
 )
 
 // handlePairings handles GET /api/pairings and POST /api/pairings.
@@ -57,7 +55,7 @@ func (s *Server) handleAutoPair(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
-	count, err := s.manager.AutoPairUnmatched(req.OwnerID)
+	count, err := s.manager.AutoPairUnmatched("")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -76,16 +74,9 @@ func (s *Server) handleAutoPair(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GET /api/pairings?owner_id=xxx
+// GET /api/pairings - returns all pairings for all accounts
 func (s *Server) listPairings(w http.ResponseWriter, r *http.Request) {
-	ownerID := r.URL.Query().Get("owner_id")
-	var pairings []db.Pairing
-	var err error
-	if ownerID != "" {
-		pairings, err = s.manager.ListPairingsByOwner(ownerID)
-	} else {
-		pairings, err = s.manager.ListPairings()
-	}
+	pairings, err := s.manager.ListPairings()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

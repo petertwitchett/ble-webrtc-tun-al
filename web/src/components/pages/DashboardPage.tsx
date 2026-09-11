@@ -86,14 +86,37 @@ export function DashboardPage() {
     setTunnelError(null);
     try {
       if (tunnelActive) {
-        await api.tunnelStop();
-        message.success('Tunnel disconnected');
+        // Disconnect and end calls on server together
+        setForceEndState('sending');
+        setForceEndResult(null);
+        const res = await api.tunnelStop();
+        if (res && typeof res.total === 'number' && res.total > 0) {
+          setForceEndResult(res);
+          if (res.success === res.total) {
+            setForceEndState('success');
+            message.success(`VPN disconnected & all ${res.success} server calls ended successfully`);
+            setTimeout(() => {
+              setForceEndState('idle');
+              setForceEndResult(null);
+            }, 6000);
+          } else {
+            setForceEndState('error');
+            message.warning(`VPN disconnected, but only ${res.success}/${res.total} server calls ended. Click 'RETRY END CALLS' to retry.`);
+          }
+        } else {
+          setForceEndState('idle');
+          message.success('VPN disconnected');
+        }
       } else {
         await api.tunnelStart();
         message.success('Tunnel connecting...');
       }
       load();
     } catch (e: any) {
+      if (tunnelActive) {
+        setForceEndState('error');
+        setForceEndResult({ error: e.message || 'Disconnect failed' });
+      }
       setTunnelError(e.message || 'Failed to toggle tunnel');
       message.error(e.message || 'Failed');
     } finally {
@@ -107,27 +130,30 @@ export function DashboardPage() {
     try {
       const result = await api.tunnelForceEndCall();
       setForceEndResult(result);
-      if (result.success > 0) {
-        setForceEndState('success');
-        message.success(`Force end call: ${result.success}/${result.total} channels ended successfully`);
+      if (result && typeof result.total === 'number' && result.total > 0) {
+        if (result.success === result.total) {
+          setForceEndState('success');
+          message.success(`Force end call: all ${result.success}/${result.total} channels ended successfully`);
+          setTimeout(() => {
+            setForceEndState('idle');
+            setForceEndResult(null);
+          }, 6000);
+        } else if (result.success > 0) {
+          setForceEndState('error');
+          message.warning(`Force end call: only ${result.success}/${result.total} channels ended. Click to retry.`);
+        } else {
+          setForceEndState('error');
+          message.error('Force end call: no channels responded with ACK. Click to retry.');
+        }
       } else {
         setForceEndState('error');
-        message.warning('Force end call: no channels responded with ACK');
+        message.warning('No active pairings found to end calls.');
       }
-      // Reset to idle after 5 seconds
-      setTimeout(() => {
-        setForceEndState('idle');
-        setForceEndResult(null);
-      }, 5000);
       load();
     } catch (e: any) {
       setForceEndState('error');
-      setForceEndResult({ error: e.message });
+      setForceEndResult({ error: e.message || 'Force end call failed' });
       message.error(e.message || 'Force end call failed');
-      setTimeout(() => {
-        setForceEndState('idle');
-        setForceEndResult(null);
-      }, 5000);
     }
   };
 
@@ -183,16 +209,20 @@ export function DashboardPage() {
         {tunnel !== null && (
           <div className="flex flex-col items-end gap-2">
             <div className="flex items-center gap-3">
-              {/* Force End Call Button */}
+              {/* Force End Call Button — indicates status and allows retrying if error */}
               <button
                 onClick={handleForceEndCall}
-                disabled={forceEndState === 'sending'}
-                title="Force end active calls on all paired servers"
+                disabled={forceEndState === 'sending' || tunnelLoading}
+                title={
+                  forceEndState === 'error'
+                    ? 'Some calls failed to end on server — click to retry ending active calls'
+                    : 'Force end active calls on all paired servers (automatically triggered on Disconnect)'
+                }
                 className={`relative overflow-hidden group flex items-center justify-center px-5 py-4 rounded-full font-bold text-base text-white shadow-lg transition-all duration-300 hover:scale-105 active:scale-95 ${
                   forceEndState === 'success'
                     ? 'bg-gradient-to-r from-emerald-400 to-green-500 shadow-green-500/30'
                     : forceEndState === 'error'
-                      ? 'bg-gradient-to-r from-red-400 to-rose-500 shadow-rose-500/30'
+                      ? 'bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 shadow-rose-500/30 animate-pulse'
                       : forceEndState === 'sending'
                         ? 'bg-gradient-to-r from-amber-400 to-orange-500 shadow-orange-500/30 animate-pulse'
                         : 'bg-gradient-to-r from-amber-400 to-orange-500 hover:from-amber-500 hover:to-orange-600 shadow-orange-500/30'
@@ -210,11 +240,11 @@ export function DashboardPage() {
                   )}
                   <span>
                     {forceEndState === 'sending'
-                      ? 'ENDING...'
+                      ? 'ENDING CALLS...'
                       : forceEndState === 'success'
                         ? 'ENDED ✓'
                         : forceEndState === 'error'
-                          ? 'FAILED'
+                          ? 'RETRY END CALLS'
                           : 'END CALLS'}
                   </span>
                 </Space>
@@ -224,7 +254,7 @@ export function DashboardPage() {
               {/* Connect/Disconnect Button */}
               <button
                 onClick={toggleTunnel}
-                disabled={tunnelLoading}
+                disabled={tunnelLoading || forceEndState === 'sending'}
                 className={`relative overflow-hidden group flex items-center justify-center px-8 py-4 rounded-full font-bold text-lg text-white shadow-lg transition-all duration-300 hover:scale-105 active:scale-95 ${
                   tunnelActive
                     ? 'bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 shadow-red-500/30'
@@ -235,14 +265,25 @@ export function DashboardPage() {
                   <span className="absolute w-full h-full rounded-full bg-white opacity-20 animate-ping" />
                 )}
                 <Space size="middle" className="relative z-10">
-                  {isConnecting
-                    ? <LoadingOutlined className="text-2xl" spin />
-                    : tunnelActive
-                      ? <FireOutlined className="text-2xl animate-pulse" />
-                      : <ThunderboltOutlined className="text-2xl" />
-                  }
+                  {tunnelLoading ? (
+                    <LoadingOutlined className="text-2xl" spin />
+                  ) : isConnecting ? (
+                    <LoadingOutlined className="text-2xl" spin />
+                  ) : tunnelActive ? (
+                    <FireOutlined className="text-2xl animate-pulse" />
+                  ) : (
+                    <ThunderboltOutlined className="text-2xl" />
+                  )}
                   <span>
-                    {tunnelLoading ? 'Wait...' : isConnecting ? 'CONNECTING...' : tunnelActive ? 'DISCONNECT' : 'CONNECT VPN'}
+                    {tunnelLoading
+                      ? tunnelActive
+                        ? 'DISCONNECTING...'
+                        : 'CONNECTING...'
+                      : isConnecting
+                        ? 'CONNECTING...'
+                        : tunnelActive
+                          ? 'DISCONNECT'
+                          : 'CONNECT VPN'}
                   </span>
                 </Space>
                 <div className="absolute inset-0 -translate-x-full group-hover:animate-[shimmer_1.5s_infinite] bg-gradient-to-r from-transparent via-white/20 to-transparent skew-x-12" />
@@ -254,10 +295,15 @@ export function DashboardPage() {
               </Tag>
             )}
             {forceEndResult && forceEndState !== 'idle' && (
-              <Text type={forceEndState === 'success' ? 'success' : 'danger'} style={{ fontSize: 11 }}>
+              <Text
+                type={forceEndState === 'success' ? 'success' : 'danger'}
+                style={{ fontSize: 11, fontWeight: 600 }}
+              >
                 {forceEndResult.error
                   ? forceEndResult.error
-                  : `${forceEndResult.success}/${forceEndResult.total} channels ended`}
+                  : forceEndState === 'success'
+                    ? `✓ ${forceEndResult.success}/${forceEndResult.total} server calls ended`
+                    : `⚠️ ${forceEndResult.success}/${forceEndResult.total} server calls ended — click to retry`}
               </Text>
             )}
           </div>

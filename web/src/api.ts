@@ -72,13 +72,14 @@ export const api = {
   remotePullAccounts: () => request('/remote/pull-accounts', { method: 'POST' }),
   remoteDBBackup: () => request('/remote/db/backup'),
   remoteDBRestore: (data: any) => request('/remote/db/restore', { method: 'POST', body: JSON.stringify(data) }),
+  remoteDBReset: () => request('/remote/db/reset', { method: 'POST' }),
   remoteSyncFromServer: () => request('/remote/sync-from-server', { method: 'POST' }),
 
-  listPairings: (ownerID?: string) => request('/pairings' + (ownerID ? `?owner_id=${ownerID}` : '')),
-  createPairing: (clientId: number, serverId: number, ownerID?: string) => request('/pairings', { method: 'POST', body: JSON.stringify({ client_account_id: clientId, server_account_id: serverId, owner_id: ownerID || '' }) }),
+  listPairings: () => request('/pairings'),
+  createPairing: (clientId: number, serverId: number) => request('/pairings', { method: 'POST', body: JSON.stringify({ client_account_id: clientId, server_account_id: serverId }) }),
   deletePairing: (id: number) => request(`/pairings/${id}`, { method: 'DELETE' }),
-  autoPair: (ownerID?: string) => request('/pairings/auto', { method: 'POST', body: JSON.stringify({ owner_id: ownerID || '' }) }),
-  availableServers: (ownerID?: string) => request('/accounts/available-servers' + (ownerID ? `?owner_id=${ownerID}` : '')),
+  autoPair: () => request('/pairings/auto', { method: 'POST' }),
+  availableServers: () => request('/accounts/available-servers'),
 
   getActive: () => request('/connections/active'),
   getHistory: (limit?: number) => request(`/connections/history?limit=${limit || 50}`),
@@ -100,6 +101,21 @@ export const api = {
   baleLoginStart: (phone: string) => request('/bale/login/start', { method: 'POST', body: JSON.stringify({ phone }) }),
   baleLoginVerify: (phone: string, code: string) => request('/bale/login/verify', { method: 'POST', body: JSON.stringify({ phone, code }) }),
 
+  // Bale client constants — view and sync upstream parameters
+  getBaleConstants: () => request('/bale/constants'),
+  syncBaleConstants: () => request('/bale/constants/sync', { method: 'POST' }),
+
+  // Routing configuration (application-level DNS + split-tunneling bypass)
+  getRoutingSettings: () => request('/routing/settings'),
+  updateRoutingSettings: (data: { dns_primary: string; dns_secondary: string; bypass_domains: string }) =>
+    request('/routing/settings', { method: 'POST', body: JSON.stringify(data) }),
+
+  // DNS Speed Benchmark & Auto-Optimizer
+  dnsBenchmarkStart: (servers?: string[]) =>
+    request('/dns/benchmark/start', { method: 'POST', body: JSON.stringify({ servers: servers || [] }) }),
+  dnsBenchmarkStatus: () => request('/dns/benchmark/status'),
+  dnsBenchmarkStop: () => request('/dns/benchmark/stop', { method: 'POST' }),
+
   // Tunnel Controls
   tunnelStart: () => request('/tunnel/start', { method: 'POST' }),
   tunnelStop: () => request('/tunnel/stop', { method: 'POST' }),
@@ -115,6 +131,12 @@ export const api = {
   // Backup & Restore
   dbBackup: () => request('/db/backup'),
   dbRestore: (data: any) => request('/db/restore', { method: 'POST', body: JSON.stringify(data) }),
+  dbReset: () => request('/db/reset', { method: 'POST' }),
+
+  // S3 Cloud Persistence (Clever Cloud Cellar S3)
+  getS3Status: () => request('/s3/status'),
+  triggerS3Backup: () => request('/s3/backup', { method: 'POST' }),
+  triggerS3Restore: () => request('/s3/restore', { method: 'POST' }),
 
   // Logs
   getLogs: (limit?: number, level?: string, component?: string) => {

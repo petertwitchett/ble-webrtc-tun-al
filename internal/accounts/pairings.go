@@ -15,8 +15,8 @@ func (m *Manager) CreatePairing(clientAccountID, serverAccountID uint, ownerID s
 		return nil, err
 	}
 
-	accountsLog.Info("Created pairing ID=%d: client=%d ↔ server=%d (owner=%s)",
-		pairing.ID, clientAccountID, serverAccountID, ownerID)
+	accountsLog.Info("Created pairing ID=%d: client=%d ↔ server=%d",
+		pairing.ID, clientAccountID, serverAccountID)
 
 	m.database.AppendEvent(db.EventPairingCreated, m.database.Role(), db.PairingEventPayload{
 		PairingID:       pairing.ID,
@@ -76,7 +76,7 @@ func (m *Manager) AutoPairUnmatched(ownerID string) (int, error) {
 		return 0, err
 	}
 	if count > 0 {
-		accountsLog.Info("Auto-paired %d accounts for owner %s", count, ownerID)
+		accountsLog.Info("Auto-paired %d accounts", count)
 	}
 	return count, nil
 }

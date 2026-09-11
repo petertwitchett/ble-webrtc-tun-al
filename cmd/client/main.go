@@ -177,6 +177,18 @@ func main() {
 
 	mainLog.Info("Client initialized. Use admin panel to add accounts, create pairings, and connect.")
 
+	// Auto-start tunnel on boot if active pairings exist in the database
+	pairings, err := clientDB.ListActivePairings()
+	if err == nil && len(pairings) > 0 {
+		mainLog.Info("🚀 Auto-starting tunnel on startup (%d active pairings found)...", len(pairings))
+		go func() {
+			time.Sleep(1 * time.Second) // allow API server to start listening first
+			if err := tm.Start(); err != nil {
+				mainLog.Warn("Auto-start tunnel failed: %v (will retry on demand or reconnect)", err)
+			}
+		}()
+	}
+
 	<-ctx.Done()
 	tm.Stop()
 	mainLog.Info(" Shutting down...")

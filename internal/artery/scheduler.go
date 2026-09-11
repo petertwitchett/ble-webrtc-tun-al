@@ -43,6 +43,18 @@ type ArteryPool struct {
 
 	// Round-robin cursor for WRR distribution.
 	cursor atomic.Uint64
+
+	// Stream lifecycle hooks for dormancy and telemetry
+	onStreamOpened func()
+	onStreamClosed func()
+}
+
+// SetStreamHooks sets callbacks for stream open and close events.
+func (p *ArteryPool) SetStreamHooks(opened, closed func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onStreamOpened = opened
+	p.onStreamClosed = closed
 }
 
 // NewArteryPool creates a new empty artery pool.
@@ -193,9 +205,17 @@ func (p *ArteryPool) OpenStream() (net.Conn, error) {
 		c.artery.IncrementStreams()
 		c.artery.Tel().IncrementTotalStreams()
 
+		p.mu.RLock()
+		onOpened := p.onStreamOpened
+		p.mu.RUnlock()
+		if onOpened != nil {
+			onOpened()
+		}
+
 		return &trackedStream{
 			Conn:   wrapQUICStream(s, c.artery.QConn()),
 			artery: c.artery,
+			pool:   p,
 		}, nil
 	}
 
@@ -361,6 +381,7 @@ func (p *ArteryPool) CloseAll() {
 type trackedStream struct {
 	net.Conn
 	artery *Artery
+	pool   *ArteryPool
 	once   sync.Once
 }
 
@@ -368,6 +389,14 @@ func (s *trackedStream) Close() error {
 	s.once.Do(func() {
 		if s.artery != nil {
 			s.artery.DecrementStreams()
+		}
+		if s.pool != nil {
+			s.pool.mu.RLock()
+			onClosed := s.pool.onStreamClosed
+			s.pool.mu.RUnlock()
+			if onClosed != nil {
+				onClosed()
+			}
 		}
 	})
 	return s.Conn.Close()

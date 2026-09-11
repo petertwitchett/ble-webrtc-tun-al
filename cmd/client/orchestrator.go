@@ -461,6 +461,64 @@ func (tm *TunnelManager) startArteryOrchestrator(
 	}
 
 	orch := artery.NewOrchestrator(tunnelPool.ArteryPool(), revivalFn)
+
+	demoteFn := func(demoteCtx context.Context) {
+		if len(pairs) <= 1 {
+			return
+		}
+		mainLog.Info("[Orchestrator] 🌙 Idle dormancy: demoting to Lane 1 single standby (closing %d secondary lines)", len(pairs)-1)
+		for idx := 1; idx < len(pairs); idx++ {
+			tp := pairs[idx]
+			label := fmt.Sprintf("ch%d", tp.Index)
+			tm.setChannelDormant(idx, true)
+
+			// 1. Unregister QUIC connection from pool immediately
+			tunnelPool.Unregister(label)
+
+			// 2. Find and extract channel state
+			mu.Lock()
+			var targetCh *channelState
+			newSlice := make([]*channelState, 0, len(*channels))
+			for _, c := range *channels {
+				if c.label == label {
+					targetCh = c
+				} else {
+					newSlice = append(newSlice, c)
+				}
+			}
+			*channels = newSlice
+			mu.Unlock()
+
+			if targetCh != nil {
+				// Clean hangup on paired server
+				tm.setChannelPhase(idx, PhaseTeardown, "idle dormancy: clean hangup")
+				tm.endCallForPair(demoteCtx, tp, label, targetCh.client)
+				go targetCh.client.CleanupMessages()
+				time.Sleep(100 * time.Millisecond)
+				targetCh.sfu.Close()
+				targetCh.client.Close()
+			} else {
+				tm.endCallForPair(demoteCtx, tp, label, nil)
+			}
+
+			tm.setChannelPhase(idx, PhaseDormant, "Standby — Lane 1 active")
+			mainLog.Info("[%s] 💤 Entered DORMANT_STANDBY", label)
+		}
+	}
+
+	wakeupFn := func(wakeCtx context.Context) {
+		if len(pairs) <= 1 {
+			return
+		}
+		mainLog.Info("[Orchestrator] ⚡ Active traffic detected: waking up dormant lanes 2..%d", len(pairs))
+		for idx := 1; idx < len(pairs); idx++ {
+			tm.setChannelDormant(idx, false)
+			tm.setChannelPhase(idx, PhaseBaleConnect, "Waking from standby...")
+			tm.notifyChannelWakeup(idx)
+		}
+	}
+
+	orch.SetDormancyHandlers(demoteFn, wakeupFn)
 	go orch.Start(ctx)
 	return orch
 }

@@ -498,3 +498,41 @@ Whenever a change is introduced to this repository:
   - The server admin panel can run the 42-server DNS benchmark directly from Clever Cloud against `google.com` and all 6 domestic Bale Meet Gateways (`meet-gwbm1.ble.ir` to `meet-gwbm6.ble.ir`).
   - Admins can click **"⚡ Auto-Apply Top 2"** to automatically apply the 2 lowest-latency DNS servers from Clever Cloud.
 
+---
+
+## 12. Intelligent Connection Resilience & Reconnection Engine
+
+### 12.1 The Problem: Irregular Client Outages & Server Orphan Calls
+Clients operating behind censored and erratic internet connections experience unpredictable disruptions ranging from brief seconds-long packet loss to multi-hour blackouts.
+- **Previous Failure Modes:**
+  1. *Client Giving Up:* The client gave up after 8 attempts (`baleFailLimit = 8`) or terminated the process if `active == 0`, requiring manual restarts.
+  2. *Server Orphan Sessions:* The server remained stuck in `IN_CALL` indefinitely because it continued generating comfort noise to the SFU while waiting on a blocking RTP read.
+  3. *Re-dial Collisions:* When a reconnecting client dialed back in, the server rejected the incoming call with "account is IN_CALL, cannot accept calls", creating a deadlock until manual server restart.
+
+### 12.2 Two-Tier Asymmetric Client Reconnection Policy
+The client never gives up reconnection attempts until the user explicitly stops the tunnel via the dashboard:
+- **Tier 1 (Burst Mode — Transient Drops):**
+  - Attempts 1 to 4: Fast exponential backoff (1s, 2s, 4s, 8s).
+  - Designed for sub-minute router reboots, brief Wi-Fi drops, and mobile carrier handoffs. Re-establishes the tunnel within seconds.
+- **Tier 2 (Sustained Mode — Long Blackouts):**
+  - Attempts 5+: Relaxed backoff progression (15s, 30s, 60s, max 90s with ±20% randomized jitter).
+  - Eliminates CPU churn, network bandwidth consumption, and server signaling load during extended multi-hour blackouts.
+- **Decoupled Proxy Readiness:**
+  - Local SOCKS5 (`:1080` / `:10909`) and HTTP (`:8080` / `:9095`) proxies bind immediately at startup and remain listening regardless of tunnel state, queuing or failing requests cleanly without crashing user applications.
+
+### 12.3 Reactive Network Watcher & Instant Wakeup
+- A lightweight background network probe (`startNetworkWatcher`) runs continuous low-overhead connectivity checks:
+  - Probes DNS and TCP endpoints every 3 seconds while offline, every 30 seconds while online.
+- As soon as the client's host reconnects to the local network / internet:
+  - The watcher fires an atomic broadcast across `netWakeupCh` via `tm.broadcastNetWakeup()`.
+  - All sleeping reconnect goroutines (`monitorAndReconnect`, `initChannelWithRetry`) immediately wake up, reset backoff counters to Tier 1, and re-dial the tunnel instantly.
+
+### 12.4 Server-Side Orphan Call Watchdog & State Hygiene
+- **Dual Dead-Peer Detection:**
+  1. *Inactivity Watchdog:* `rtpconn.Conn` tracks `lastInbound` timestamps across all incoming frames (including Opus DTX silence keepalives). If no packet is received for **35 seconds**, the server marks the client as dead, terminates the session, and sets account status to `IDLE`.
+  2. *LiveKit Disconnect Signaling:* The LiveKit SFU transport watches for `ParticipantInfo_DISCONNECTED` events from the room signaling and sets `peerDisconnected`.
+- **Intelligent Re-dial Preemption:**
+  - In `Router.ShouldAcceptCall`, if an incoming call arrives for a server account currently marked `IN_CALL`, but the caller ID matches the **verified paired client** (`callerID == pairing.ClientAccount.BaleUserID`):
+  - The router recognizes this as a client reconnecting after an unnotified network drop.
+  - It automatically invokes `Router.PreemptSession()`, tearing down the stale session and accepting the incoming call without delay.
+

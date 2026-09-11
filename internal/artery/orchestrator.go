@@ -3,6 +3,8 @@ package artery
 import (
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/salman/ble-webrtc-tun/internal/logger"
@@ -54,30 +56,116 @@ const (
 // It runs asynchronously in a separate goroutine.
 type RevivalFunc func(ctx context.Context, label string, pairIndex int)
 
+// DormancyFunc is a callback invoked when the orchestrator transitions power states.
+type DormancyFunc func(ctx context.Context)
+
 // Orchestrator is the background engine that continuously monitors artery
 // health and makes intelligent scheduling decisions.
 //
-// Three responsibilities:
+// Four responsibilities:
 //  1. Telemetry Loop (500ms) — Reads QUIC transport stats, updates EWMA RTT
 //  2. Hysteresis Engine (1s) — Evaluates demotion/promotion thresholds
 //  3. Dead Detection (3s) — Detects dead arteries and triggers revival
+//  4. Idle Dormancy Engine — Demotes to single standby (Lane 1) after 3m of zero traffic
 type Orchestrator struct {
-	pool       *ArteryPool
-	revivalFn  RevivalFunc
-	done       chan struct{}
+	pool      *ArteryPool
+	revivalFn RevivalFunc
+	done      chan struct{}
 
 	// Track which arteries are currently being revived (prevent double-revival)
 	reviving map[string]bool
+
+	// Idle Dormancy Engine
+	activeStreams atomic.Int64
+	idleTimer     *time.Timer
+	dormantMu     sync.Mutex
+	isDormant     bool
+	demoteFn      DormancyFunc
+	wakeupFn      DormancyFunc
 }
 
 // NewOrchestrator creates a new orchestrator for the given pool.
 func NewOrchestrator(pool *ArteryPool, revivalFn RevivalFunc) *Orchestrator {
-	return &Orchestrator{
+	o := &Orchestrator{
 		pool:      pool,
 		revivalFn: revivalFn,
 		done:      make(chan struct{}),
 		reviving:  make(map[string]bool),
 	}
+	if pool != nil {
+		pool.SetStreamHooks(o.OnStreamOpened, o.OnStreamClosed)
+	}
+	return o
+}
+
+// SetDormancyHandlers configures callbacks for demoting to single standby and waking up lanes.
+func (o *Orchestrator) SetDormancyHandlers(demote, wakeup DormancyFunc) {
+	o.dormantMu.Lock()
+	defer o.dormantMu.Unlock()
+	o.demoteFn = demote
+	o.wakeupFn = wakeup
+}
+
+// OnStreamOpened is called whenever an active proxy stream opens.
+// If the pool is currently dormant, it cancels idle timers and awakens standby lanes.
+func (o *Orchestrator) OnStreamOpened() {
+	count := o.activeStreams.Add(1)
+	if count == 1 {
+		o.dormantMu.Lock()
+		if o.idleTimer != nil {
+			o.idleTimer.Stop()
+			o.idleTimer = nil
+		}
+		wasDormant := o.isDormant
+		if wasDormant {
+			o.isDormant = false
+			orchLog.Info("⚡ First active stream detected — waking up dormant standby lanes")
+			if o.wakeupFn != nil {
+				go o.wakeupFn(context.Background())
+			}
+		}
+		o.dormantMu.Unlock()
+	}
+}
+
+// OnStreamClosed is called whenever a proxy stream closes.
+// If active streams drop to 0, it arms the 3-minute idle timer to enter dormancy.
+func (o *Orchestrator) OnStreamClosed() {
+	count := o.activeStreams.Add(-1)
+	if count <= 0 {
+		if count < 0 {
+			o.activeStreams.Store(0)
+		}
+		o.dormantMu.Lock()
+		if o.idleTimer != nil {
+			o.idleTimer.Stop()
+		}
+		// 3-minute idle timer before demoting
+		o.idleTimer = time.AfterFunc(3*time.Minute, func() {
+			o.dormantMu.Lock()
+			defer o.dormantMu.Unlock()
+			if o.activeStreams.Load() == 0 && !o.isDormant {
+				o.isDormant = true
+				orchLog.Info("🌙 System idle for 3 minutes (0 active streams) — demoting to Lane 1 single standby")
+				if o.demoteFn != nil {
+					go o.demoteFn(context.Background())
+				}
+			}
+		})
+		o.dormantMu.Unlock()
+	}
+}
+
+// IsDormant returns true if the orchestrator is in low-power single standby mode.
+func (o *Orchestrator) IsDormant() bool {
+	o.dormantMu.Lock()
+	defer o.dormantMu.Unlock()
+	return o.isDormant
+}
+
+// ActiveStreams returns current number of active proxy streams.
+func (o *Orchestrator) ActiveStreams() int64 {
+	return o.activeStreams.Load()
 }
 
 // Start begins the orchestrator's background loops.

@@ -198,6 +198,7 @@ const (
 	PhaseTunnelActive ChannelPhase = "TUNNEL_ACTIVE"
 	PhaseTeardown     ChannelPhase = "TEARDOWN"
 	PhaseDisconnected ChannelPhase = "DISCONNECTED"
+	PhaseDormant      ChannelPhase = "DORMANT_STANDBY"
 	PhaseError        ChannelPhase = "ERROR"
 )
 
@@ -287,6 +288,57 @@ type TunnelManager struct {
 	// Network reachability watcher and instant wakeup broadcast
 	netUp       atomic.Bool
 	netWakeupCh chan struct{}
+
+	// Dormancy state management for lines 2..N
+	dormantMu       sync.RWMutex
+	dormantChannels map[int]bool
+	dormantWakeup   map[int]chan struct{}
+}
+
+func (tm *TunnelManager) isChannelDormant(idx int) bool {
+	tm.dormantMu.RLock()
+	defer tm.dormantMu.RUnlock()
+	if tm.dormantChannels == nil {
+		return false
+	}
+	return tm.dormantChannels[idx]
+}
+
+func (tm *TunnelManager) setChannelDormant(idx int, dormant bool) {
+	tm.dormantMu.Lock()
+	defer tm.dormantMu.Unlock()
+	if tm.dormantChannels == nil {
+		tm.dormantChannels = make(map[int]bool)
+	}
+	tm.dormantChannels[idx] = dormant
+}
+
+func (tm *TunnelManager) channelWakeupCh(idx int) <-chan struct{} {
+	tm.dormantMu.Lock()
+	defer tm.dormantMu.Unlock()
+	if tm.dormantWakeup == nil {
+		tm.dormantWakeup = make(map[int]chan struct{})
+	}
+	ch, ok := tm.dormantWakeup[idx]
+	if !ok || ch == nil {
+		ch = make(chan struct{}, 1)
+		tm.dormantWakeup[idx] = ch
+	}
+	return ch
+}
+
+func (tm *TunnelManager) notifyChannelWakeup(idx int) {
+	tm.dormantMu.Lock()
+	defer tm.dormantMu.Unlock()
+	if tm.dormantWakeup == nil {
+		return
+	}
+	if ch, ok := tm.dormantWakeup[idx]; ok && ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accounts.Manager) *TunnelManager {
@@ -319,14 +371,16 @@ func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accoun
 	}
 
 	tm := &TunnelManager{
-		cfg:         cfg,
-		database:    database,
-		manager:     manager,
-		clientID:    clientID,
-		obfuscator:  obf,
-		refresh:     &refreshSupervisor{},
-		routing:     initRoutingEngine(cfg, database),
-		netWakeupCh: make(chan struct{}),
+		cfg:             cfg,
+		database:        database,
+		manager:         manager,
+		clientID:        clientID,
+		obfuscator:      obf,
+		refresh:         &refreshSupervisor{},
+		routing:         initRoutingEngine(cfg, database),
+		netWakeupCh:     make(chan struct{}),
+		dormantChannels: make(map[int]bool),
+		dormantWakeup:   make(map[int]chan struct{}),
 	}
 	tm.netUp.Store(true)
 	return tm
@@ -568,13 +622,11 @@ func (tm *TunnelManager) GetDetailedStatus() TunnelStatus {
 		}
 	}
 
-	// Build proxy address list from all local IPs
+	// Build proxy address list (bound strictly to loopback)
 	var proxyAddrs []ProxyAddress
 	if active && activeCount > 0 {
-		for _, ip := range getLocalIPs() {
-			proxyAddrs = append(proxyAddrs, ProxyAddress{Type: "SOCKS5", Addr: ip + ":10909"})
-			proxyAddrs = append(proxyAddrs, ProxyAddress{Type: "HTTP", Addr: ip + ":9095"})
-		}
+		proxyAddrs = append(proxyAddrs, ProxyAddress{Type: "SOCKS5", Addr: "127.0.0.1:10909"})
+		proxyAddrs = append(proxyAddrs, ProxyAddress{Type: "HTTP", Addr: "127.0.0.1:9095"})
 	}
 
 	// Collect artery telemetry if pool is active
@@ -940,15 +992,20 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 	// Start proactive network reachability monitor
 	tm.startNetworkWatcher(ctx)
 
-	// Ensure SOCKS5 & HTTP proxies are listening immediately on startup so local applications
-	// can bind and route traffic as soon as any artery connects.
+	// Ensure SOCKS5 & HTTP proxies are listening immediately on startup.
+	// Bound strictly to 127.0.0.1 to prevent unauthorized background traffic leaks from local network.
 	proxyOnce.Do(func() {
-		go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool, tm.routing)
-		go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool, tm.routing)
-		mainLog.Info(" 🚀 SOCKS5 (:10909) and HTTP (:9095) proxies listening — awaiting active arteries")
-		for _, ip := range getLocalIPs() {
-			mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
+		socksAddr := "127.0.0.1:10909"
+		if env := os.Getenv("SOCKS5_LISTEN"); env != "" {
+			socksAddr = env
 		}
+		httpAddr := "127.0.0.1:9095"
+		if env := os.Getenv("HTTP_LISTEN"); env != "" {
+			httpAddr = env
+		}
+		go startSOCKS5(ctx, socksAddr, tunnelPool, tm.routing)
+		go startHTTPProxy(ctx, httpAddr, tunnelPool, tm.routing)
+		mainLog.Info(" 🚀 SOCKS5 (%s) and HTTP (%s) proxies listening on loopback", socksAddr, httpAddr)
 	})
 
 	// Background health monitor + stats: runs continuously as channels join
@@ -1106,6 +1163,25 @@ func (tm *TunnelManager) monitorAndReconnect(
 	mainLog.Info("[%s] 🔄 Next scheduled refresh in %v", label, time.Until(refreshAt).Round(time.Second))
 
 	for {
+		// If this channel has been demoted to DORMANT_STANDBY, pause here until awakened
+		if idx > 0 && tm.isChannelDormant(idx) {
+			currentCh = nil
+			currentQConn = nil
+			mainLog.Info("[%s] 💤 Pausing reconnect loop in DORMANT_STANDBY", label)
+			select {
+			case <-ctx.Done():
+				return
+			case <-tm.channelWakeupCh(idx):
+				mainLog.Info("[%s] ⏰ Awakened from DORMANT_STANDBY — reconnecting", label)
+				tm.refreshChannel(ctx, tunnelPool, &currentCh, &currentQConn, idx, tp, label, mu, channels)
+				if currentCh != nil && currentQConn != nil {
+					consecutiveFails = 0
+					refreshAt = time.Now().Add(tm.nextRefreshInterval())
+					continue
+				}
+			}
+		}
+
 		// ── Liveness check every 2s ───────────────────────────────────────
 		select {
 		case <-ctx.Done():
@@ -1527,6 +1603,13 @@ func handleSOCKS5(conn net.Conn, p *pool.TunnelPool, re *RoutingEngine) {
 		return
 	}
 
+	// Filter upstream loopback pseudo-domains (e.g. sing-box/v2ray .udp-over-tcp.arpa)
+	if ShouldDropLocally(targetAddr) {
+		mainLog.Warn("[SOCKS5] 🛡️ Dropping local loopback/pseudo-domain target: %s", targetAddr)
+		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
 	// Send success response
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	conn.SetDeadline(time.Time{})
@@ -1602,6 +1685,12 @@ func handleHTTPProxy(conn net.Conn, p *pool.TunnelPool, re *RoutingEngine) {
 	}
 	headersStr := headersBuilder.String()
 
+	if ShouldDropLocally(target) {
+		mainLog.Warn("[HTTP] 🛡️ Dropping local loopback/pseudo-domain target: %s", target)
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+
 	if method == "CONNECT" {
 		// HTTPS tunnel — classify before relaying.
 		conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
@@ -1628,6 +1717,12 @@ func handleHTTPProxy(conn net.Conn, p *pool.TunnelPool, re *RoutingEngine) {
 	}
 	if !strings.Contains(host, ":") {
 		host = host + ":80"
+	}
+
+	if ShouldDropLocally(host) {
+		mainLog.Warn("[HTTP] 🛡️ Dropping local loopback/pseudo-domain target: %s", host)
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return
 	}
 
 	reqLine := fmt.Sprintf("%s %s %s\r\n%s", method, path, parts[2], headersStr)

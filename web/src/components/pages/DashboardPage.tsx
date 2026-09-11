@@ -28,6 +28,7 @@ const PHASE_LABELS: Record<string, { label: string; color: string; icon: React.R
   WAITING_FOR_TRACK:   { label: 'Waiting for Track',   color: 'warning',    icon: <LoadingOutlined spin /> },
   SETTING_UP_TUNNEL:   { label: 'Setting up Tunnel',   color: 'processing', icon: <LoadingOutlined spin /> },
   TUNNEL_ACTIVE:       { label: 'Active',              color: 'success',    icon: <CheckCircleOutlined /> },
+  DORMANT_STANDBY:     { label: 'Dormant Standby',    color: 'blue',       icon: <ClockCircleOutlined /> },
   DISCONNECTED:        { label: 'Disconnected',        color: 'default',    icon: <CloseCircleOutlined /> },
   ERROR:               { label: 'Error',               color: 'error',      icon: <CloseCircleOutlined /> },
 };

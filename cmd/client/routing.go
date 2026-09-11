@@ -127,6 +127,31 @@ func (re *RoutingEngine) InstallAppDNS() {
 	routingLog.Info("Application DNS installed: %s / %s", primary, secondary)
 }
 
+// ShouldDropLocally identifies upstream loopback pseudo-domains (e.g. sing-box / V2Ray
+// sp.v2.udp-over-tcp.arpa), non-routable local domains, and loopback addresses that must
+// never be tunneled across WebRTC to prevent tight reconnect loops and severe bandwidth leaks.
+func ShouldDropLocally(target string) bool {
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+	}
+	host = strings.TrimSpace(strings.ToLower(host))
+
+	// Drop sing-box / V2Ray internal loopback pseudo-domains
+	if strings.HasSuffix(host, ".udp-over-tcp.arpa") || strings.HasSuffix(host, ".arpa") {
+		return true
+	}
+	// Drop local mDNS / dotless / private test domains
+	if strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	// Drop self-referential / unroutable loopback addresses
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
+		return true
+	}
+	return false
+}
+
 // classifyAndRelay intercepts a proxy transaction (SOCKS5 or HTTP CONNECT),
 // resolves the target host through the application DNS engine, classifies it
 // via the BypassEngine, and routes accordingly:
@@ -139,6 +164,12 @@ func (re *RoutingEngine) InstallAppDNS() {
 // resolution on the client is only used for the bypass classification
 // decision.
 func (re *RoutingEngine) classifyAndRelay(targetAddr string, localConn net.Conn, p *pool.TunnelPool) {
+	if ShouldDropLocally(targetAddr) {
+		routingLog.Warn("[Routing] Dropping local pseudo-domain/unroutable target: %s", targetAddr)
+		localConn.Close()
+		return
+	}
+
 	host, port, err := net.SplitHostPort(targetAddr)
 	if err != nil || host == "" {
 		// Can't parse — fall through to the tunnel path (server handles it).
@@ -222,6 +253,12 @@ func relayBidir(a, b net.Conn) {
 // branch it dials the target directly over the local interface and forwards
 // the raw HTTP request.
 func (re *RoutingEngine) classifyHTTPPlain(host, reqLine string, localConn net.Conn, p *pool.TunnelPool) {
+	if ShouldDropLocally(host) {
+		routingLog.Warn("[Routing] Dropping local pseudo-domain/unroutable HTTP target: %s", host)
+		localConn.Close()
+		return
+	}
+
 	// Extract the bare hostname (strip port) for classification.
 	classifyHost := host
 	if h, _, err := net.SplitHostPort(host); err == nil {

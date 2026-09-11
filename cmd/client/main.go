@@ -622,11 +622,13 @@ func (tm *TunnelManager) GetDetailedStatus() TunnelStatus {
 		}
 	}
 
-	// Build proxy address list (bound strictly to loopback)
+	// Build proxy address list from all local IPs
 	var proxyAddrs []ProxyAddress
 	if active && activeCount > 0 {
-		proxyAddrs = append(proxyAddrs, ProxyAddress{Type: "SOCKS5", Addr: "127.0.0.1:10909"})
-		proxyAddrs = append(proxyAddrs, ProxyAddress{Type: "HTTP", Addr: "127.0.0.1:9095"})
+		for _, ip := range getLocalIPs() {
+			proxyAddrs = append(proxyAddrs, ProxyAddress{Type: "SOCKS5", Addr: ip + ":10909"})
+			proxyAddrs = append(proxyAddrs, ProxyAddress{Type: "HTTP", Addr: ip + ":9095"})
+		}
 	}
 
 	// Collect artery telemetry if pool is active
@@ -993,19 +995,22 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 	tm.startNetworkWatcher(ctx)
 
 	// Ensure SOCKS5 & HTTP proxies are listening immediately on startup.
-	// Bound strictly to 127.0.0.1 to prevent unauthorized background traffic leaks from local network.
+	// Binds to 0.0.0.0 by default so local network routers/devices can connect.
 	proxyOnce.Do(func() {
-		socksAddr := "127.0.0.1:10909"
+		socksAddr := "0.0.0.0:10909"
 		if env := os.Getenv("SOCKS5_LISTEN"); env != "" {
 			socksAddr = env
 		}
-		httpAddr := "127.0.0.1:9095"
+		httpAddr := "0.0.0.0:9095"
 		if env := os.Getenv("HTTP_LISTEN"); env != "" {
 			httpAddr = env
 		}
 		go startSOCKS5(ctx, socksAddr, tunnelPool, tm.routing)
 		go startHTTPProxy(ctx, httpAddr, tunnelPool, tm.routing)
-		mainLog.Info(" 🚀 SOCKS5 (%s) and HTTP (%s) proxies listening on loopback", socksAddr, httpAddr)
+		mainLog.Info(" 🚀 SOCKS5 (%s) and HTTP (%s) proxies listening — awaiting active arteries", socksAddr, httpAddr)
+		for _, ip := range getLocalIPs() {
+			mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
+		}
 	})
 
 	// Background health monitor + stats: runs continuously as channels join

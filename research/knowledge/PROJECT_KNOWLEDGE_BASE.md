@@ -534,5 +534,24 @@ The client never gives up reconnection attempts until the user explicitly stops 
 - **Intelligent Re-dial Preemption:**
   - In `Router.ShouldAcceptCall`, if an incoming call arrives for a server account currently marked `IN_CALL`, but the caller ID matches the **verified paired client** (`callerID == pairing.ClientAccount.BaleUserID`):
   - The router recognizes this as a client reconnecting after an unnotified network drop.
-  - It automatically invokes `Router.PreemptSession()`, tearing down the stale session and accepting the incoming call without delay.
+---
 
+## 13. Zero-Idle-Traffic Bandwidth Architecture & Multi-Platform Deployment
+
+### 13.1 Root Cause of 30 GB Overnight Bandwidth Leak
+During periods of zero user activity (e.g., overnight), the tunnel previously leaked ~30 GB of traffic due to three cumulative factors:
+1. **Unrestricted 0.0.0.0 Proxy Listeners:** SOCKS5 and HTTP proxies listened on all network interfaces, allowing external network equipment, IoT devices, or loopback background services to relay traffic through the tunnel.
+2. **Upstream Loopback / Pseudo-Domain Leaks:** Operating system network probes (`*.udp-over-tcp.arpa`, `.arpa`, `.local`, `127.0.0.1`) were routed across WebRTC rather than rejected locally.
+3. **Continuous 20ms Dummy Silence Transmission:** `rtpconn.silenceLoop()` continuously pumped dummy Opus comfort noise packets at 50 packets per second (every 20ms) across all open channels.
+4. **Redundant Obfuscation Secret Overhead:** An unneeded XChaCha20-Poly1305 double cipher layer added 40 bytes per packet and heavy CPU encryption churn on top of existing QUIC TLS 1.3 and DTLS/SRTP encryption.
+
+### 13.2 Technical Solutions Implemented
+- **Localhost Proxy Binding:** Listeners default strictly to `127.0.0.1:10909` (SOCKS5) and `127.0.0.1:9095` (HTTP).
+- **Local Pseudo-Domain Interception:** `routing.ShouldDropLocally()` drops `.udp-over-tcp.arpa`, `.arpa`, `.local`, `.internal`, `.localhost`, and loopback IPs immediately.
+- **Obfuscation Removal:** Unset `OBFUSCATION_SECRET` on both server and client for maximum MTU and direct zero-overhead transport.
+- **Orchestrator Idle Dormancy:** Lane 1 acts as standby. Lanes 2–6 are demoted to `DORMANT_STANDBY` after 3 minutes of zero active streams and re-armed instantly on new inbound traffic.
+- **DTX Comfort Noise Keepalive:** Transmission cadence reduced from 20ms (50 pkts/s) to 5000ms (0.2 pkts/s), achieving a 250x reduction in idle packet overhead.
+
+### 13.3 Deployment Verification
+- **Clever Cloud:** Docker deployment `3beac24f` verified active with S3 Cellar persistence and Split-DNS (`1.0.0.1` / `1.1.1.1`).
+- **Local Proxmox Server (`192.168.2.150`):** Systemd service `my-client.service` updated to commit `3beac24f`. All 6 pairings verified connected (`TUNNEL_ACTIVE`), with SOCKS5 and HTTP proxies tested and functional.
